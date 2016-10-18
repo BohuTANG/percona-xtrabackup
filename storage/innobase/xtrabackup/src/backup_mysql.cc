@@ -70,6 +70,7 @@ bool have_galera_enabled = false;
 bool have_flush_engine_logs = false;
 bool have_multi_threaded_slave = false;
 bool have_gtid_slave = false;
+bool have_tokudb = false;
 
 /* Kill long selects */
 os_thread_id_t	kill_query_thread_id;
@@ -356,6 +357,7 @@ get_mysql_vars(MYSQL *connection)
 	char *innodb_page_size_var = NULL;
 	char *innodb_log_checksums_var = NULL;
 	char *innodb_log_checksum_algorithm_var = NULL;
+	char *tokudb_checkpoint_lock_var = NULL;
 
 	unsigned long server_version = mysql_get_server_version(connection);
 
@@ -387,6 +389,7 @@ get_mysql_vars(MYSQL *connection)
 		{"innodb_log_checksums", &innodb_log_checksums_var},
 		{"innodb_log_checksum_algorithm",
 			&innodb_log_checksum_algorithm_var},
+		{"tokudb_checkpoint_lock", &tokudb_checkpoint_lock_var},
 		{NULL, NULL}
 	};
 
@@ -553,6 +556,11 @@ get_mysql_vars(MYSQL *connection)
 			srv_log_checksum_algorithm =
 				SRV_CHECKSUM_ALGORITHM_NONE;
 		}
+	}
+
+	/* TokuDB plugin check via tokudb_checkpoint_lock */
+	if (tokudb_checkpoint_lock_var != NULL) {
+		have_tokudb = true;
 	}
 
 	parse_show_engine_innodb_status(connection);
@@ -923,6 +931,7 @@ lock_tables(MYSQL *connection)
 		xb_mysql_query(connection,
 			"SET SESSION lock_wait_timeout=31536000", false);
 	}
+
 
 	if (have_backup_locks) {
 		msg_ts("Executing LOCK TABLES FOR BACKUP...\n");
