@@ -64,7 +64,9 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 using std::min;
 
 /* list of files to sync for --rsync mode */
-std::set<std::string> rsync_list;
+static std::set<std::string> rsync_list;
+/* locations of tablespaces read from .isl files */
+static std::map<std::string, std::string> tablespace_locations;
 
 /* Whether LOCK BINLOG FOR BACKUP has been issued during backup */
 bool binlog_locked;
@@ -266,6 +268,11 @@ datadir_iter_next_database(datadir_iter_t *it)
 		if (it->dbinfo.type == OS_FILE_TYPE_FILE) {
 			it->is_file = true;
 			return(true);
+		}
+
+		if (check_if_skip_database_by_path(it->dbpath)) {
+			msg("Skipping db: %s\n", it->dbpath);
+			continue;
 		}
 
 		/* We want wrong directory permissions to be a fatal error for
@@ -1151,6 +1158,57 @@ move_file(ds_ctxt_t *datasink,
 
 
 /************************************************************************
+Read link from .isl file if any and store it in the global map associated
+with given tablespace. */
+static
+void
+read_link_file(const char *ibd_filepath, const char *link_filepath)
+{
+	char *filepath= NULL;
+
+	FILE *file = fopen(link_filepath, "r+b");
+	if (file) {
+		filepath = static_cast<char*>(malloc(OS_FILE_MAX_PATH));
+
+		os_file_read_string(file, filepath, OS_FILE_MAX_PATH);
+		fclose(file);
+
+		if (strlen(filepath)) {
+			/* Trim whitespace from end of filepath */
+			ulint lastch = strlen(filepath) - 1;
+			while (lastch > 4 && filepath[lastch] <= 0x20) {
+				filepath[lastch--] = 0x00;
+			}
+			os_normalize_path(filepath);
+		}
+
+		tablespace_locations[ibd_filepath] = filepath;
+	}
+	free(filepath);
+}
+
+
+/************************************************************************
+Return the location of given .ibd if it was previously read
+from .isl file.
+@return NULL or destination .ibd file path. */
+static
+const char *
+tablespace_filepath(const char *ibd_filepath)
+{
+	std::map<std::string, std::string>::iterator it;
+
+	it = tablespace_locations.find(ibd_filepath);
+
+	if (it != tablespace_locations.end()) {
+		return it->second.c_str();
+	}
+
+	return NULL;
+}
+
+
+/************************************************************************
 Copy or move file depending on current mode.
 @return true in case of success. */
 static
@@ -1161,34 +1219,35 @@ copy_or_move_file(const char *src_file_path,
 		  uint thread_n)
 {
 	ds_ctxt_t *datasink = ds_data;		/* copy to datadir by default */
-	char *filepath = NULL;
 	char filedir[FN_REFLEN];
 	size_t filedir_len;
 	bool ret;
 
+	/* read the link from .isl file */
+	if (ends_with(src_file_path, ".isl")) {
+		char *ibd_filepath;
+
+		ibd_filepath = strdup(src_file_path);
+		strcpy(ibd_filepath + strlen(ibd_filepath) - 3, "ibd");
+
+		read_link_file(ibd_filepath, src_file_path);
+
+		free(ibd_filepath);
+	}
+
 	/* check if there is .isl file */
 	if (ends_with(src_file_path, ".ibd")) {
 		char *link_filepath;
+		const char *filepath;
 
 		link_filepath = strdup(src_file_path);
 		strcpy(link_filepath + strlen(link_filepath) - 3, "isl");
 
-		FILE *file = fopen(link_filepath, "r+b");
-		if (file) {
-			filepath = static_cast<char*>(malloc(OS_FILE_MAX_PATH));
+		read_link_file(src_file_path, link_filepath);
 
-			os_file_read_string(file, filepath, OS_FILE_MAX_PATH);
-			fclose(file);
+		filepath = tablespace_filepath(src_file_path);
 
-			if (strlen(filepath)) {
-				/* Trim whitespace from end of filepath */
-				ulint lastch = strlen(filepath) - 1;
-				while (lastch > 4 && filepath[lastch] <= 0x20) {
-					filepath[lastch--] = 0x00;
-				}
-				os_normalize_path(filepath);
-			}
-
+		if (filepath != NULL) {
 			dirname_part(filedir, filepath, &filedir_len);
 
 			dst_file_path = filepath + filedir_len;
@@ -1201,6 +1260,7 @@ copy_or_move_file(const char *src_file_path,
 
 			datasink = ds_create(dst_dir, DS_TYPE_LOCAL);
 		}
+
 		free(link_filepath);
 	}
 
@@ -1210,7 +1270,6 @@ copy_or_move_file(const char *src_file_path,
 			  dst_dir, thread_n));
 
 cleanup:
-	free(filepath);
 
 	if (datasink != ds_data) {
 		ds_destroy(datasink);
@@ -1252,7 +1311,7 @@ backup_files(const char *from, bool prep_mode)
 	       prep_mode ? "prep copy of" : "to backup");
 
 	datadir_node_init(&node);
-	it = datadir_iter_new(from);
+	it = datadir_iter_new(from, false);
 
 	while (datadir_iter_next(it, &node)) {
 
@@ -1701,11 +1760,11 @@ ibx_copy_incremental_over_full()
 				xtrabackup_incremental_dir,
 				sup_files[i]);
 
-			if (file_exists(sup_files[i])) {
-				unlink(sup_files[i]);
-			}
-
-			if (file_exists(path)) {
+			if (file_exists(path))
+			{
+				if (file_exists(sup_files[i])) {
+					unlink(sup_files[i]);
+				}
 				copy_file(ds_data, path, sup_files[i], 0);
 			}
 		}
@@ -2077,6 +2136,13 @@ decrypt_decompress_file(const char *filepath, uint thread_n)
 	 	if (system(cmd.str().c_str()) != 0) {
 	 		return(false);
 	 	}
+
+	 	if (opt_remove_original) {
+	 		msg_ts("[%02u] removing %s\n", thread_n, filepath);
+	 		if (my_delete(filepath, MYF(MY_WME)) != 0) {
+	 			return(false);
+	 		}
+	 	}
 	 }
 
  	return(true);
@@ -2194,7 +2260,7 @@ version_check()
 		return;
 	}
 
-	fputs((const char *)version_check_pl, pipe);
+	fwrite((const char *) version_check_pl, version_check_pl_len, 1, pipe);
 
 	pclose(pipe);
 }

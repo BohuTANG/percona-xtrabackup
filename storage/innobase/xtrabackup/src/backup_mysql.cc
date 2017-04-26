@@ -45,6 +45,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <ha_prototypes.h>
 #include <srv0srv.h>
 #include <string.h>
+#include <limits>
 #include "common.h"
 #include "xtrabackup.h"
 #include "xtrabackup_version.h"
@@ -104,6 +105,9 @@ MYSQL *
 xb_mysql_connect()
 {
 	MYSQL *connection = mysql_init(NULL);
+	char mysql_port_str[std::numeric_limits<int>::digits10 + 3];
+
+	sprintf(mysql_port_str, "%d", opt_port);
 
 	if (connection == NULL) {
 		msg("Failed to init MySQL struct: %s.\n",
@@ -112,9 +116,11 @@ xb_mysql_connect()
 	}
 
 	msg_ts("Connecting to MySQL server host: %s, user: %s, password: %s, "
-	       "port: %d, socket: %s\n", opt_host ? opt_host : "localhost",
-	       opt_user, opt_password ? "set" : "not set",
-	       opt_port, opt_socket);
+	       "port: %s, socket: %s\n", opt_host ? opt_host : "localhost",
+	       opt_user ? opt_user : "not set",
+	       opt_password ? "set" : "not set",
+	       opt_port != 0 ? mysql_port_str : "not set",
+	       opt_socket ? opt_socket : "not set");
 
 #ifdef HAVE_OPENSSL
 	/*
@@ -125,7 +131,7 @@ xb_mysql_connect()
 	    opt_ssl_mode < SSL_MODE_VERIFY_CA &&
 	    (opt_ssl_ca || opt_ssl_capath))
 	{
-		printf("WARNING: no verification of server certificate will "
+		msg("WARNING: no verification of server certificate will "
 		       "be done. Use --ssl-mode=VERIFY_CA or "
 		       "VERIFY_IDENTITY.\n");
 	}
@@ -385,6 +391,7 @@ get_mysql_vars(MYSQL *connection)
 	char *innodb_log_checksums_var = NULL;
 	char *innodb_log_checksum_algorithm_var = NULL;
 	char *tokudb_checkpoint_lock_var = NULL;
+	char *innodb_checksum_algorithm_var = NULL;
 
 	unsigned long server_version = mysql_get_server_version(connection);
 
@@ -417,6 +424,7 @@ get_mysql_vars(MYSQL *connection)
 		{"innodb_log_checksum_algorithm",
 			&innodb_log_checksum_algorithm_var},
 		{"tokudb_checkpoint_lock", &tokudb_checkpoint_lock_var},
+		{"innodb_checksum_algorithm", &innodb_checksum_algorithm_var},
 		{NULL, NULL}
 	};
 
@@ -570,6 +578,19 @@ get_mysql_vars(MYSQL *connection)
 			    innodb_checksum_algorithm_typelib.type_names[i])
 			    == 0) {
 				srv_log_checksum_algorithm = i;
+			}
+		}
+	}
+
+	if (!innodb_checksum_algorithm_specified &&
+		innodb_checksum_algorithm_var) {
+		for (uint i = 0;
+		     i < innodb_checksum_algorithm_typelib.count;
+		     i++) {
+			if (strcasecmp(innodb_checksum_algorithm_var,
+			    innodb_checksum_algorithm_typelib.type_names[i])
+			    == 0) {
+				srv_checksum_algorithm = i;
 			}
 		}
 	}
@@ -1521,8 +1542,10 @@ write_xtrabackup_info(MYSQL *connection)
 		incremental_lsn, /* innodb_from_lsn */
 		metadata_to_lsn, /* innodb_to_lsn */
 		(xtrabackup_tables /* partial */
+		 || xtrabackup_tables_exclude
 		 || xtrabackup_tables_file
 		 || xtrabackup_databases
+		 || xtrabackup_databases_exclude
 		 || xtrabackup_databases_file) ? "Y" : "N",
 		xtrabackup_incremental ? "Y" : "N", /* incremental */
 		xb_stream_name[xtrabackup_stream_fmt], /* format */
@@ -1649,8 +1672,10 @@ write_xtrabackup_info(MYSQL *connection)
 	/* partial (Y | N) */
 	bind[idx].buffer_type = MYSQL_TYPE_STRING;
 	bind[idx].buffer = (char*)((xtrabackup_tables
+				    || xtrabackup_tables_exclude
 				    || xtrabackup_tables_file
 				    || xtrabackup_databases
+				    || xtrabackup_databases_exclude
 				    || xtrabackup_databases_file) ? "Y" : "N");
 	bind[idx].buffer_length = 1;
 	++idx;

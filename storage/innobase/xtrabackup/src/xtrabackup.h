@@ -65,9 +65,6 @@ extern xb_page_bitmap *changed_page_bitmap;
 
 extern ulint	xtrabackup_rebuild_threads;
 
-extern my_option	xb_long_options[];
-extern uint		xb_long_options_count;
-
 extern char		*xtrabackup_incremental;
 extern my_bool		xtrabackup_incremental_force_scan;
 
@@ -82,6 +79,8 @@ extern char		*xtrabackup_tables;
 extern char		*xtrabackup_tables_file;
 extern char		*xtrabackup_databases;
 extern char		*xtrabackup_databases_file;
+extern char		*xtrabackup_tables_exclude;
+extern char		*xtrabackup_databases_exclude;
 
 extern my_bool		xtrabackup_compact;
 extern ibool		xtrabackup_compress;
@@ -133,6 +132,7 @@ extern my_bool		opt_force_non_empty_dirs;
 extern my_bool		opt_noversioncheck;
 extern my_bool		opt_no_backup_locks;
 extern my_bool		opt_decompress;
+extern my_bool		opt_remove_original;
 
 extern char		*opt_incremental_history_name;
 extern char		*opt_incremental_history_uuid;
@@ -214,6 +214,17 @@ bool
 check_if_skip_table(
 /******************/
 	const char*	name);	/*!< in: path to the table */
+
+
+/************************************************************************
+Checks if a database specified by path should be skipped from backup based on
+the --databases, --databases_file or --databases_exclude options.
+
+@return TRUE if the table should be skipped. */
+my_bool
+check_if_skip_database_by_path(
+	const char* path /*!< in: path to the db directory. */
+);
 
 /************************************************************************
 Check if parameter is set in defaults file or via command line argument

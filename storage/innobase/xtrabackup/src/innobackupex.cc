@@ -65,6 +65,8 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "fil_cur.h"
 #include "write_filt.h"
 #include "backup_copy.h"
+#include "xbcrypt_common.h"
+#include "ds_encrypt.h"
 
 using std::min;
 using std::max;
@@ -148,7 +150,6 @@ char *ibx_xtrabackup_tables_file;
 long ibx_xtrabackup_throttle;
 char *ibx_opt_mysql_tmpdir;
 longlong ibx_xtrabackup_use_memory;
-ulong ibx_redo_log_version;
 
 
 static inline int ibx_msg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -179,12 +180,7 @@ static inline int ibx_msg(const char *fmt, ...)
 
 enum innobackupex_options
 {
-	OPT_USER = 256,
-	OPT_HOST,
-	OPT_PORT,
-	OPT_PASSWORD,
-	OPT_SOCKET,
-	OPT_APPLY_LOG,
+	OPT_APPLY_LOG = 256,
 	OPT_COPY_BACK,
 	OPT_MOVE_BACK,
 	OPT_REDO_ONLY,
@@ -236,8 +232,7 @@ enum innobackupex_options
 	OPT_STREAM,
 	OPT_TABLES_FILE,
 	OPT_THROTTLE,
-	OPT_USE_MEMORY,
-	OPT_REDO_LOG_VERSION
+	OPT_USE_MEMORY
 };
 
 ibx_mode_t ibx_mode = IBX_MODE_BACKUP;
@@ -384,31 +379,31 @@ static struct my_option ibx_long_options[] =
 	 (uchar *) &opt_ibx_decompress,
 	 0, GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
 
-	{"user", OPT_USER, "This option specifies the MySQL username used "
+	{"user", 'u', "This option specifies the MySQL username used "
 	 "when connecting to the server, if that's not the current user. "
 	 "The option accepts a string argument. See mysql --help for details.",
 	 (uchar*) &opt_ibx_user, (uchar*) &opt_ibx_user, 0, GET_STR,
 	 REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
 
-	{"host", OPT_HOST, "This option specifies the host to use when "
+	{"host", 'H', "This option specifies the host to use when "
 	 "connecting to the database server with TCP/IP.  The option accepts "
 	 "a string argument. See mysql --help for details.",
 	 (uchar*) &opt_ibx_host, (uchar*) &opt_ibx_host, 0, GET_STR,
 	 REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
 
-	{"port", OPT_PORT, "This option specifies the port to use when "
+	{"port", 'P', "This option specifies the port to use when "
 	 "connecting to the database server with TCP/IP.  The option accepts "
 	 "a string argument. See mysql --help for details.",
 	 &opt_ibx_port, &opt_ibx_port, 0, GET_UINT, REQUIRED_ARG,
 	 0, 0, 0, 0, 0, 0},
 
-	{"password", OPT_PASSWORD, "This option specifies the password to use "
+	{"password", 'p', "This option specifies the password to use "
 	 "when connecting to the database. It accepts a string argument.  "
 	 "See mysql --help for details.",
-	 (uchar*) &opt_ibx_password, (uchar*) &opt_ibx_password, 0, GET_STR,
+	 0, 0, 0, GET_STR,
 	 REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
 
-	{"socket", OPT_SOCKET, "This option specifies the socket to use when "
+	{"socket", 'S', "This option specifies the socket to use when "
 	 "connecting to the local database server with a UNIX domain socket.  "
 	 "The option accepts a string argument. See mysql --help for details.",
 	 (uchar*) &opt_ibx_socket, (uchar*) &opt_ibx_socket, 0, GET_STR,
@@ -733,11 +728,6 @@ static struct my_option ibx_long_options[] =
 	 0, GET_LL, REQUIRED_ARG, 100*1024*1024L, 1024*1024L, LLONG_MAX, 0,
 	 1024*1024L, 0},
 
-	{"redo-log-version", OPT_REDO_LOG_VERSION,
-	 "Redo log version of the backup. For --apply-log only.",
-	 &ibx_redo_log_version, &ibx_redo_log_version, 0, GET_UINT,
-	 REQUIRED_ARG, 1, 0, 0, 0, 0, 0},
-
 	{ 0, 0, 0, 0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0}
 };
 
@@ -908,7 +898,21 @@ ibx_get_one_option(int optid,
 		}
 		xtrabackup_encrypt = TRUE;
 		break;
-	}
+	case 'p':
+		if (argument)
+		{
+			char *start = argument;
+			my_free(opt_ibx_password);
+			opt_ibx_password= my_strdup(PSI_NOT_INSTRUMENTED,
+						    argument, MYF(MY_FAE));
+			/*  Destroy argument */
+			while (*argument)
+				*argument++= 'x';
+			if (*start)
+				start[1]=0 ;
+		}
+		break;
+        }
 	return(0);
 }
 
@@ -1064,7 +1068,6 @@ ibx_init()
 	xtrabackup_throttle = ibx_xtrabackup_throttle;
 	opt_mysql_tmpdir = ibx_opt_mysql_tmpdir;
 	xtrabackup_use_memory = ibx_xtrabackup_use_memory;
-	redo_log_version = ibx_redo_log_version;
 
 	if (!opt_ibx_incremental
 	    && (xtrabackup_incremental

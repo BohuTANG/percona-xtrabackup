@@ -10,6 +10,8 @@
    :glob:
 
 
+   release-notes/2.4/2.4.6
+   release-notes/2.4/2.4.5
    release-notes/2.4/2.4.4
    release-notes/2.4/2.4.3
    release-notes/2.4/2.4.2
@@ -23,6 +25,8 @@
    :maxdepth: 1
    :glob:
 
+   release-notes/2.3/2.3.7
+   release-notes/2.3/2.3.6
    release-notes/2.3/2.3.5
    release-notes/2.3/2.3.4
    release-notes/2.3/2.3.3
