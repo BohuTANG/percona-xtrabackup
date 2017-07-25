@@ -377,6 +377,8 @@ my_bool opt_noversioncheck = FALSE;
 my_bool opt_no_backup_locks = FALSE;
 my_bool opt_decompress = FALSE;
 my_bool opt_remove_original = FALSE;
+my_bool opt_tables_compatibility_check = TRUE;
+static my_bool opt_check_privileges = FALSE;
 
 static const char *binlog_info_values[] = {"off", "lockless", "on", "auto",
 					   NullS};
@@ -412,6 +414,10 @@ uint opt_lock_wait_threshold = 0;
 uint opt_debug_sleep_before_unlock = 0;
 uint opt_safe_slave_backup_timeout = 0;
 
+my_bool opt_lock_ddl = FALSE;
+my_bool opt_lock_ddl_per_table = FALSE;
+uint opt_lock_ddl_timeout = 0;
+
 const char *opt_history = NULL;
 my_bool opt_decrypt = FALSE;
 
@@ -430,6 +436,9 @@ my_bool ssl_mode_set_explicitly= FALSE;
 char *opt_server_public_key = NULL;
 #endif
 #endif
+
+static void
+check_all_privileges();
 
 /* Whether xtrabackup_binlog_info should be created on recovery */
 static bool recover_binlog_info;
@@ -632,6 +641,9 @@ enum options_xtrabackup
   OPT_GALERA_INFO,
   OPT_SLAVE_INFO,
   OPT_NO_LOCK,
+  OPT_LOCK_DDL,
+  OPT_LOCK_DDL_TIMEOUT,
+  OPT_LOCK_DDL_PER_TABLE,
   OPT_SAFE_SLAVE_BACKUP,
   OPT_RSYNC,
   OPT_FORCE_NON_EMPTY_DIRS,
@@ -662,6 +674,9 @@ enum options_xtrabackup
 
   OPT_XTRA_TABLES_EXCLUDE,
   OPT_XTRA_DATABASES_EXCLUDE,
+
+  OPT_XTRA_TABLES_COMPATIBILITY_CHECK,
+  OPT_XTRA_CHECK_PRIVILEGES,
 };
 
 struct my_option xb_client_options[] =
@@ -870,6 +885,23 @@ struct my_option xb_client_options[] =
    (uchar *) &opt_no_lock, (uchar *) &opt_no_lock, 0,
    GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
 
+  {"lock-ddl", OPT_LOCK_DDL, "Issue LOCK TABLES FOR BACKUP if it is "
+   "supported by server at the beginning of the backup to block all DDL "
+   "operations.", (uchar*) &opt_lock_ddl, (uchar*) &opt_lock_ddl, 0,
+   GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
+
+  {"lock-ddl-timeout", OPT_LOCK_DDL_TIMEOUT,
+   "If LOCK TABLES FOR BACKUP does not return within given timeout, abort "
+   "the backup.",
+   (uchar*) &opt_lock_ddl_timeout,
+   (uchar*) &opt_lock_ddl_timeout, 0, GET_UINT,
+   REQUIRED_ARG, 31536000, 1, 31536000, 0, 1, 0},
+
+  {"lock-ddl-per-table", OPT_LOCK_DDL_PER_TABLE, "Lock DDL for each table "
+   "before xtrabackup starts to copy it and until the backup is completed.",
+   (uchar*) &opt_lock_ddl_per_table, (uchar*) &opt_lock_ddl_per_table, 0,
+   GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
+
   {"safe-slave-backup", OPT_SAFE_SLAVE_BACKUP, "Stop slave SQL thread "
    "and wait to start backup until Slave_open_temp_tables in "
    "\"SHOW STATUS\" is zero. If there are no open temporary tables, "
@@ -906,6 +938,13 @@ struct my_option xb_client_options[] =
    (uchar *) &opt_noversioncheck,
    (uchar *) &opt_noversioncheck,
    0, GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
+
+  {"tables-compatibility-check", OPT_XTRA_TABLES_COMPATIBILITY_CHECK,
+   "This option enables engine compatibility warning.",
+   (uchar *) & opt_tables_compatibility_check,
+   (uchar *) & opt_tables_compatibility_check,
+   0, GET_BOOL, NO_ARG, TRUE, 0, 0, 0, 0, 0},
+
 
   {"no-backup-locks", OPT_NO_BACKUP_LOCKS, "This option controls if "
    "backup locks should be used instead of FLUSH TABLES WITH READ LOCK "
@@ -1065,6 +1104,10 @@ struct my_option xb_client_options[] =
    &opt_encrypt_server_id, &opt_encrypt_server_id, 0,
    GET_UINT, REQUIRED_ARG, 0, 0, UINT_MAX32,
    0, 0, 0},
+
+  {"check-privileges", OPT_XTRA_CHECK_PRIVILEGES, "Check database user "
+    "privileges before performing any query.", &opt_check_privileges,
+   &opt_check_privileges, 0, GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
 
 #include "sslopt-longopts.h"
 
@@ -2132,6 +2175,26 @@ xtrabackup_stream_metadata(ds_ctxt_t *ds_ctxt)
 	return(rc);
 }
 
+
+static
+my_bool write_to_file(const char *filepath, const char *data)
+{
+	size_t len = strlen(data);
+	FILE *fp = fopen(filepath, "w");
+	if(!fp) {
+		msg("xtrabackup: Error: cannot open %s\n", filepath);
+		return(FALSE);
+	}
+	if (fwrite(data, len, 1, fp) < 1) {
+		fclose(fp);
+		return(FALSE);
+	}
+
+	fclose(fp);
+	return TRUE;
+}
+
+
 /***********************************************************************
 Write backup meta info to a specified file.
 @return TRUE on success, FALSE on failure. */
@@ -2140,26 +2203,9 @@ my_bool
 xtrabackup_write_metadata(const char *filepath)
 {
 	char		buf[1024];
-	size_t		len;
-	FILE		*fp;
 
 	xtrabackup_print_metadata(buf, sizeof(buf));
-
-	len = strlen(buf);
-
-	fp = fopen(filepath, "w");
-	if(!fp) {
-		msg("xtrabackup: Error: cannot open %s\n", filepath);
-		return(FALSE);
-	}
-	if (fwrite(buf, len, 1, fp) < 1) {
-		fclose(fp);
-		return(FALSE);
-	}
-
-	fclose(fp);
-
-	return(TRUE);
+	return write_to_file(filepath, buf);
 }
 
 /***********************************************************************
@@ -2247,6 +2293,20 @@ xb_write_delta_metadata(const char *filename, const xb_delta_info_t *info)
 	}
 
 	return(ret);
+}
+
+static my_bool
+xtrabackup_write_info(const char *filepath)
+{
+	char *xtrabackup_info_data = get_xtrabackup_info(mysql_connection);
+	if (!xtrabackup_info_data) {
+		return FALSE;
+	}
+
+	my_bool result = write_to_file(filepath, xtrabackup_info_data);
+
+	free(xtrabackup_info_data);
+	return result;
 }
 
 /* ================= backup ================= */
@@ -2591,6 +2651,10 @@ xtrabackup_copy_datafile(fil_node_t* node, uint thread_n)
 	const char* const node_path = node->name;
 
 	is_system = !fil_is_user_tablespace_id(node->space->id);
+
+	if (!is_system && opt_lock_ddl_per_table) {
+		mdl_lock_table(node->space->id);
+	}
 
 	if (!is_system && check_if_skip_table(node_name)) {
 		msg("[%02u] Skipping %s.\n", thread_n, node_name);
@@ -3494,6 +3558,30 @@ xb_load_single_table_tablespace(
 	delete file;
 }
 
+static
+bool
+is_remote_tablespace_name(const char *path)
+{
+	size_t len = strlen(path);
+	return len > 4 && strcmp(path + len - 4, ".isl") == 0;
+}
+
+static
+bool
+is_local_tablespace_name(const char *path)
+{
+	size_t len = strlen(path);
+	return len > 4 && strcmp(path + len - 4, ".ibd") == 0;
+}
+
+static
+bool
+is_tablespace_name(const char *path)
+{
+	return is_remote_tablespace_name(path)
+		|| is_local_tablespace_name(path);
+}
+
 /********************************************************************//**
 At the server startup, if we need crash recovery, scans the database
 directories under the MySQL datadir, looking for .ibd files. Those files are
@@ -3534,25 +3622,18 @@ xb_load_single_table_tablespaces(bool (*pred)(const char*, const char*))
 					 &dbinfo);
 	while (ret == 0) {
 		ulint len;
+		bool is_tablespace;
+		bool is_remote;
+
+		is_tablespace = is_tablespace_name(dbinfo.name);
+		is_remote = is_remote_tablespace_name(dbinfo.name);
 
 		/* General tablespaces are always at the first level of the
 		data home dir */
-		if (dbinfo.type == OS_FILE_TYPE_FILE &&
-		    strlen(dbinfo.name) > 4 &&
-		    strcmp(dbinfo.name + strlen(dbinfo.name) - 4, ".isl")
-				== 0 &&
+		if (dbinfo.type == OS_FILE_TYPE_FILE && is_tablespace &&
 		    !(pred && !pred(".", dbinfo.name))) {
-			xb_load_single_table_tablespace(NULL, dbinfo.name,
-							true);
-		}
-
-		if (dbinfo.type == OS_FILE_TYPE_FILE &&
-		    strlen(dbinfo.name) > 4 &&
-		    strcmp(dbinfo.name + strlen(dbinfo.name) - 4, ".ibd")
-				== 0 &&
-		    !(pred && !pred(".", dbinfo.name))) {
-			xb_load_single_table_tablespace(NULL, dbinfo.name,
-							false);
+			xb_load_single_table_tablespace(
+				NULL, dbinfo.name, is_remote);
 		}
 
 		if (dbinfo.type == OS_FILE_TYPE_FILE
@@ -3591,26 +3672,22 @@ xb_load_single_table_tablespaces(bool (*pred)(const char*, const char*))
 		if (dbdir != NULL) {
 
 			/* We found a database directory; loop through it,
-			looking for possible .ibd files in it */
+			looking for possible .ibd and .isl files in it */
 
 			ret = fil_file_readdir_next_file(&err, dbpath, dbdir,
 							 &fileinfo);
 			while (ret == 0) {
-				bool is_remote;
-
 				if (fileinfo.type == OS_FILE_TYPE_DIR) {
 					goto next_file_item;
 				}
 
-				is_remote = strcmp(fileinfo.name
-					  + strlen(fileinfo.name) - 4,
-					  ".isl") == 0;
+				is_tablespace = is_tablespace_name(
+					fileinfo.name);
+				is_remote = is_remote_tablespace_name(
+					fileinfo.name);
 
 				/* We found a symlink or a file */
-				if (strlen(fileinfo.name) > 4
-				    && (0 == strcmp(fileinfo.name
-						   + strlen(fileinfo.name) - 4,
-						   ".ibd"))
+				if (is_tablespace
 				    && (!pred
 					|| pred(dbinfo.name, fileinfo.name))) {
 					xb_load_single_table_tablespace(
@@ -3957,22 +4034,31 @@ xb_register_table(
 }
 
 static
+bool compile_regex(
+	const char* regex_string,
+	const char* error_context,
+	xb_regex_t* compiled_re)
+{
+	char	errbuf[100];
+	int	ret = xb_regcomp(compiled_re, regex_string, REG_EXTENDED);
+	if (ret != 0) {
+		xb_regerror(ret, compiled_re, errbuf, sizeof(errbuf));
+		msg("xtrabackup: error: %s regcomp(%s): %s\n",
+			error_context, regex_string, errbuf);
+		return false;
+	}
+	return true;
+}
+
+static
 void
 xb_add_regex_to_list(
 	const char* regex,  /*!< in: regex */
 	const char* error_context,  /*!< in: context to error message */
 	regex_list_t* list) /*! in: list to put new regex to */
 {
-	char			errbuf[100];
-	int			ret;
-
 	xb_regex_t compiled_regex;
-	ret = xb_regcomp(&compiled_regex, regex, REG_EXTENDED);
-
-	if (ret != 0) {
-		xb_regerror(ret, &compiled_regex, errbuf, sizeof(errbuf));
-		msg("xtrabackup: error: %s regcomp(%s): %s\n",
-			error_context, regex, errbuf);
+	if (!compile_regex(regex, error_context, &compiled_regex)) {
 		exit(EXIT_FAILURE);
 	}
 
@@ -4326,6 +4412,41 @@ end:
 #endif
 }
 
+/**************************************************************************
+Prints a warning for every table that uses unsupported engine and
+hence will not be backed up. */
+static void
+xb_tables_compatibility_check()
+{
+	const char* query = "SELECT\n"
+			    "  CONCAT(table_schema, '/', table_name), engine\n"
+			    "FROM information_schema.tables\n"
+			    "WHERE engine NOT IN (\n"
+			    "  'MyISAM', 'InnoDB', 'CSV', 'MRG_MYISAM'\n"
+			    ")\n"
+			    "AND table_schema NOT IN (\n"
+			    "  'performance_schema', 'information_schema',"
+			    "  'mysql'\n"
+			    ");";
+
+	MYSQL_RES* result = xb_mysql_query(mysql_connection, query, true, true);
+	MYSQL_ROW row;
+	if (!result) {
+		return;
+	}
+
+	ut_a(mysql_num_fields(result) == 2);
+	while ((row = mysql_fetch_row(result))) {
+		if (!check_if_skip_table(row[0])) {
+			*strchr(row[0], '/') = '.';
+			msg("Warning: \"%s\" uses engine \"%s\" "
+			    "and will not be backed up.\n", row[0], row[1]);
+		}
+	}
+
+	mysql_free_result(result);
+}
+
 void
 xtrabackup_backup_func(void)
 {
@@ -4362,9 +4483,11 @@ xtrabackup_backup_func(void)
 	srv_read_only_mode = TRUE;
 
 	srv_backup_mode = TRUE;
-	srv_close_files = xb_close_files;
+	/* We can safely close files if we don't allow DDL during the
+	backup */
+	srv_close_files = xb_close_files || opt_lock_ddl;
 
-	if (srv_close_files)
+	if (xb_close_files)
 		msg("xtrabackup: warning: close-files specified. Use it "
 		    "at your own risk. If there are DDL operations like table DROP TABLE "
 		    "or RENAME TABLE during the backup, inconsistent backup will be "
@@ -4440,6 +4563,10 @@ xtrabackup_backup_func(void)
 	xb_keyring_init(xb_keyring_file_data);
 
 	xb_filters_init();
+
+	if (opt_tables_compatibility_check) {
+		xb_tables_compatibility_check();
+	}
 
 	{
 	ibool	log_file_created;
@@ -4674,6 +4801,10 @@ reread_log_header:
 		    "files transfer\n", xtrabackup_parallel);
 	}
 
+	if (opt_lock_ddl_per_table) {
+		mdl_lock_init();
+	}
+
 	it = datafiles_iter_new(f_system);
 	if (it == NULL) {
 		msg("xtrabackup: Error: datafiles_iter_new() failed.\n");
@@ -4779,6 +4910,11 @@ skip_last_cp:
 		msg("xtrabackup: Error: failed to stream metadata.\n");
 		exit(EXIT_FAILURE);
 	}
+
+	if (!backup_finish()) {
+		exit(EXIT_FAILURE);
+	}
+
 	if (xtrabackup_extra_lsndir) {
 		char	filename[FN_REFLEN];
 
@@ -4790,10 +4926,18 @@ skip_last_cp:
 			exit(EXIT_FAILURE);
 		}
 
+		sprintf(filename, "%s/%s", xtrabackup_extra_lsndir,
+			XTRABACKUP_INFO);
+		if (!xtrabackup_write_info(filename)) {
+			msg("xtrabackup: Error: failed to write info "
+			    "to '%s'.\n", filename);
+			exit(EXIT_FAILURE);
+		}
+
 	}
 
-	if (!backup_finish()) {
-		exit(EXIT_FAILURE);
+	if (opt_lock_ddl_per_table) {
+		mdl_unlock_all();
 	}
 
 	xtrabackup_destroy_datasinks();
@@ -7919,11 +8063,239 @@ xb_init()
 			return(false);
 		}
 
+		if (opt_check_privileges) {
+			check_all_privileges();
+		}
+
 		history_start_time = time(NULL);
+
+		if (opt_lock_ddl &&
+			!lock_tables_for_backup(mysql_connection,
+				opt_lock_ddl_timeout)) {
+			return(false);
+		}
+
+		parse_show_engine_innodb_status(mysql_connection);
 
 	}
 
 	return(true);
+}
+
+static const char*
+normalize_privilege_target_name(const char* name)
+{
+	if (strcmp(name, "*") == 0) {
+		return "\\*";
+	} else {
+		/* should have no regex special characters. */
+		ut_ad(strpbrk(name, ".()[]*+?") == 0);
+	}
+	return name;
+}
+
+/******************************************************************//**
+Check if specific privilege is granted.
+Uses regexp magic to check if requested privilege is granted for given
+database.table or database.* or *.*
+or if user has 'ALL PRIVILEGES' granted.
+@return true if requested privilege is granted, false otherwise. */
+static bool
+has_privilege(const std::list<std::string> &granted,
+	const char* required,
+	const char* db_name,
+	const char* table_name)
+{
+	char buffer[1000];
+	xb_regex_t priv_re;
+	xb_regmatch_t tables_regmatch[1];
+	bool result = false;
+
+	db_name = normalize_privilege_target_name(db_name);
+	table_name = normalize_privilege_target_name(table_name);
+
+	int written = snprintf(buffer, sizeof(buffer),
+		"GRANT .*(%s)|(ALL PRIVILEGES).* ON (\\*|`%s`)\\.(\\*|`%s`)",
+		required, db_name, table_name);
+	if (written < 0 || written == sizeof(buffer)
+		|| !compile_regex(buffer, "has_privilege", &priv_re)) {
+		exit(EXIT_FAILURE);
+	}
+
+	typedef std::list<std::string>::const_iterator string_iter;
+	for (string_iter i = granted.begin(), e = granted.end(); i != e; ++i) {
+		int res = xb_regexec(&priv_re, i->c_str(),
+			1, tables_regmatch, 0);
+
+		if (res != REG_NOMATCH) {
+			result = true;
+			break;
+		}
+	}
+
+	xb_regfree(&priv_re);
+	return result;
+}
+
+enum {
+	PRIVILEGE_OK = 0,
+	PRIVILEGE_WARNING = 1,
+	PRIVILEGE_ERROR = 2,
+};
+
+/******************************************************************//**
+Check if specific privilege is granted.
+Prints error message if required privilege is missing.
+@return PRIVILEGE_OK if requested privilege is granted, error otherwise. */
+static
+int check_privilege(
+	const std::list<std::string> &granted_priv, /* in: list of
+							granted privileges*/
+	const char* required,		/* in: required privilege name */
+	const char* target_database,	/* in: required privilege target
+						database name */
+	const char* target_table,	/* in: required privilege target
+						table name */
+	int error = PRIVILEGE_ERROR)	/* in: return value if privilege
+						is not granted */
+{
+	if (!has_privilege(granted_priv,
+		required, target_database, target_table)) {
+		msg("xtrabackup: %s: missing required privilege %s on %s.%s\n",
+			(error == PRIVILEGE_ERROR ? "Error" : "Warning"),
+			required, target_database, target_table);
+		return error;
+	}
+	return PRIVILEGE_OK;
+}
+
+/******************************************************************//**
+Check DB user privileges according to the intended actions.
+
+Fetches DB user privileges, determines intended actions based on
+command-line arguments and prints missing privileges.
+May terminate application with EXIT_FAILURE exit code.*/
+static void
+check_all_privileges()
+{
+	if (!mysql_connection) {
+		/* Not connected, no queries is going to be executed. */
+		return;
+	}
+
+	/* Fetch effective privileges. */
+	std::list<std::string> granted_privileges;
+	MYSQL_ROW row = 0;
+	MYSQL_RES* result = xb_mysql_query(mysql_connection, "SHOW GRANTS",
+		true);
+	while((row = mysql_fetch_row(result))) {
+		granted_privileges.push_back(*row);
+	}
+	mysql_free_result(result);
+
+	int check_result = PRIVILEGE_OK;
+	bool reload_checked = false;
+
+	/* SHOW DATABASES */
+	check_result |= check_privilege(granted_privileges,
+		"SHOW DATABASES", "*", "*");
+
+	/* SELECT 'INNODB_CHANGED_PAGES', COUNT(*) FROM INFORMATION_SCHEMA.PLUGINS */
+	check_result |= check_privilege(
+		granted_privileges,
+		"SELECT", "INFORMATION_SCHEMA", "PLUGINS");
+
+	/* SHOW ENGINE INNODB STATUS */
+	/* SHOW FULL PROCESSLIST */
+	check_result |= check_privilege(granted_privileges,
+		"PROCESS", "*", "*");
+
+	if (xb_mysql_numrows(mysql_connection,
+		"SHOW DATABASES LIKE 'PERCONA_SCHEMA';",
+		false) == 0) {
+		/* CREATE DATABASE IF NOT EXISTS PERCONA_SCHEMA */
+		check_result |= check_privilege(
+			granted_privileges,
+			"CREATE", "*", "*");
+	} else if (xb_mysql_numrows(mysql_connection,
+		"SHOW TABLES IN PERCONA_SCHEMA "
+		"LIKE 'xtrabackup_history';",
+		false) == 0) {
+		/* CREATE TABLE IF NOT EXISTS PERCONA_SCHEMA.xtrabackup_history */
+		check_result |= check_privilege(
+			granted_privileges,
+			"CREATE", "PERCONA_SCHEMA", "*");
+	}
+
+	/* FLUSH NO_WRITE_TO_BINLOG ENGINE LOGS */
+	if (have_flush_engine_logs
+		/* FLUSH NO_WRITE_TO_BINLOG TABLES */
+		|| (opt_lock_wait_timeout && !opt_kill_long_queries_timeout
+			&& !opt_no_lock)
+		/* FLUSH TABLES WITH READ LOCK */
+		|| !opt_no_lock
+		/* LOCK BINLOG FOR BACKUP */
+		/* UNLOCK BINLOG */
+		|| (have_backup_locks && !opt_no_lock)) {
+		check_result |= check_privilege(
+			granted_privileges,
+			"RELOAD", "*", "*");
+		reload_checked = true;
+	}
+
+
+	/* FLUSH TABLES WITH READ LOCK */
+	if (!opt_no_lock
+		/* LOCK TABLES FOR BACKUP */
+		/* UNLOCK TABLES */
+		&& ((have_backup_locks && !opt_no_lock) || opt_slave_info
+		|| opt_binlog_info == BINLOG_INFO_ON)) {
+		check_result |= check_privilege(
+			granted_privileges,
+			"LOCK TABLES", "*", "*");
+	}
+
+	/* SELECT innodb_to_lsn FROM PERCONA_SCHEMA.xtrabackup_history ... */
+	if (opt_incremental_history_name || opt_incremental_history_uuid) {
+		check_result |= check_privilege(
+			granted_privileges,
+			"SELECT", "PERCONA_SCHEMA", "xtrabackup_history");
+	}
+
+	if (!reload_checked
+		/* FLUSH BINARY LOGS */
+		&& opt_galera_info) {
+		check_result |= check_privilege(
+			granted_privileges,
+			"RELOAD", "*", "*",
+			PRIVILEGE_WARNING);
+	}
+
+	/* KILL ... */
+	if (opt_kill_long_queries_timeout
+		/* START SLAVE SQL_THREAD */
+		/* STOP SLAVE SQL_THREAD */
+		|| opt_safe_slave_backup) {
+		check_result |= check_privilege(
+			granted_privileges,
+			"SUPER", "*", "*",
+			PRIVILEGE_WARNING);
+	}
+
+	/* SHOW MASTER STATUS */
+	/* SHOW SLAVE STATUS */
+	if (opt_galera_info || opt_slave_info
+		|| (opt_no_lock && opt_safe_slave_backup)
+		/* LOCK BINLOG FOR BACKUP */
+		|| (have_backup_locks && !opt_no_lock)) {
+		check_result |= check_privilege(granted_privileges,
+			"REPLICATION CLIENT", "*", "*",
+			PRIVILEGE_WARNING);
+	}
+
+	if (check_result & PRIVILEGE_ERROR) {
+		exit(EXIT_FAILURE);
+	}
 }
 
 void
@@ -8284,6 +8656,17 @@ int main(int argc, char **argv)
 		msg("xtrabackup: warning: "
 		    "as --innodb-log-arch-dir and --to-archived-lsn can be used "
 		    "only with --prepare they will be reset\n");
+	}
+	if (xtrabackup_throttle && !xtrabackup_backup) {
+		xtrabackup_throttle = 0;
+		msg("xtrabackup: warning: --throttle has effect "
+		    "only with --backup");
+	}
+
+	if (xtrabackup_backup && xtrabackup_compact) {
+		msg("xtrabackup: error: compact backups are not supported "
+		    "by this version of xtrabackup\n");
+		exit(EXIT_FAILURE);
 	}
 
 	/* cannot execute both for now */

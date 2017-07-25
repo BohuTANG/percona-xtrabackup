@@ -2,6 +2,7 @@
 #define XTRABACKUP_BACKUP_MYSQL_H
 
 #include <mysql.h>
+#include <string>
 
 /* mysql flavor and version */
 enum mysql_flavor_t { FLAVOR_UNKNOWN, FLAVOR_MYSQL,
@@ -27,7 +28,7 @@ extern time_t history_lock_time;
 
 
 extern bool sql_thread_started;
-extern char *mysql_slave_position;
+extern std::string mysql_slave_position;
 extern char *mysql_binlog_position;
 extern char *buffer_pool_filename;
 
@@ -59,6 +60,9 @@ MYSQL_RES *
 xb_mysql_query(MYSQL *connection, const char *query, bool use_result,
 		bool die_on_error = true);
 
+my_ulonglong
+xb_mysql_numrows(MYSQL *connection, const char *query, bool die_on_error);
+
 void
 unlock_all(MYSQL *connection);
 
@@ -67,6 +71,9 @@ write_current_binlog_file(MYSQL *connection);
 
 bool
 write_binlog_info(MYSQL *connection);
+
+char*
+get_xtrabackup_info(MYSQL *connection);
 
 bool
 write_xtrabackup_info(MYSQL *connection);
@@ -78,7 +85,10 @@ bool
 lock_binlog_maybe(MYSQL *connection);
 
 bool
-lock_tables(MYSQL *connection);
+lock_tables_for_backup(MYSQL *connection, int timeout = 31536000);
+
+bool
+lock_tables_maybe(MYSQL *connection);
 
 bool
 wait_for_safe_slave(MYSQL *connection);
@@ -89,5 +99,16 @@ write_galera_info(MYSQL *connection);
 bool
 write_slave_info(MYSQL *connection);
 
+void
+parse_show_engine_innodb_status(MYSQL *connection);
+
+void
+mdl_lock_init();
+
+void
+mdl_lock_table(ulint space_id);
+
+void
+mdl_unlock_all();
 
 #endif

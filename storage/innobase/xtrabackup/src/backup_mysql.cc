@@ -80,16 +80,27 @@ os_event_t	kill_query_thread_stopped;
 os_event_t	kill_query_thread_stop;
 
 bool sql_thread_started = false;
-char *mysql_slave_position = NULL;
+std::string mysql_slave_position;
 char *mysql_binlog_position = NULL;
 char *buffer_pool_filename = NULL;
+static char *backup_uuid = NULL;
 
 /* History on server */
 time_t history_start_time;
 time_t history_end_time;
 time_t history_lock_time;
 
+/* Stream type name, to be used with xtrabackup_stream_fmt */
+const char *xb_stream_format_name[] = {"file", "tar", "xbstream"};
+
 MYSQL *mysql_connection;
+
+/* Whether LOCK BINLOG FOR BACKUP has been issued during backup */
+static bool binlog_locked;
+
+/* Whether LOCK TABLES FOR BACKUP / FLUSH TABLES WITH READ LOCK has been issued
+during backup */
+static bool tables_locked;
 
 extern "C" {
 MYSQL * STDCALL
@@ -200,28 +211,40 @@ xb_mysql_query(MYSQL *connection, const char *query, bool use_result,
 	return mysql_result;
 }
 
+my_ulonglong
+xb_mysql_numrows(MYSQL *connection, const char *query, bool die_on_error)
+{
+	my_ulonglong rows_count = 0;
+	MYSQL_RES *result = xb_mysql_query(connection, query, true,
+		die_on_error);
+	if (result) {
+		rows_count = mysql_num_rows(result);
+		mysql_free_result(result);
+	}
+	return rows_count;
+}
+
 
 struct mysql_variable {
 	const char *name;
 	char **value;
 };
 
-
+/*********************************************************************//**
+Read mysql_variable from MYSQL_RES, return number of rows consumed. */
 static
-void
-read_mysql_variables(MYSQL *connection, const char *query, mysql_variable *vars,
+int
+read_mysql_variables_from_result(MYSQL_RES *mysql_result, mysql_variable *vars,
 	bool vertical_result)
 {
-	MYSQL_RES *mysql_result;
 	MYSQL_ROW row;
 	mysql_variable *var;
-
-	mysql_result = xb_mysql_query(connection, query, true);
-
 	ut_ad(!vertical_result || mysql_num_fields(mysql_result) == 2);
+	int rows_read = 0;
 
 	if (vertical_result) {
 		while ((row = mysql_fetch_row(mysql_result))) {
+			++rows_read;
 			char *name = row[0];
 			char *value = row[1];
 			for (var = vars; var->name; var++) {
@@ -235,6 +258,8 @@ read_mysql_variables(MYSQL *connection, const char *query, mysql_variable *vars,
 		MYSQL_FIELD *field;
 
 		if ((row = mysql_fetch_row(mysql_result)) != NULL) {
+			mysql_field_seek(mysql_result, 0);
+			++rows_read;
 			int i = 0;
 			while ((field = mysql_fetch_field(mysql_result))
 				!= NULL) {
@@ -250,7 +275,17 @@ read_mysql_variables(MYSQL *connection, const char *query, mysql_variable *vars,
 			}
 		}
 	}
+	return rows_read;
+}
 
+
+static
+void
+read_mysql_variables(MYSQL *connection, const char *query, mysql_variable *vars,
+	bool vertical_result)
+{
+	MYSQL_RES *mysql_result = xb_mysql_query(connection, query, true);
+	read_mysql_variables_from_result(mysql_result, vars, vertical_result);
 	mysql_free_result(mysql_result);
 }
 
@@ -263,9 +298,9 @@ free_mysql_variables(mysql_variable *vars)
 
 	for (var = vars; var->name; var++) {
 		free(*(var->value));
+		*var->value = NULL;
 	}
 }
-
 
 static
 char *
@@ -288,7 +323,17 @@ read_mysql_one_value(MYSQL *connection, const char *query)
 	return(result);
 }
 
+/* UUID of the backup, gives same value until explicitly reset.
+Returned value should NOT be free()-d. */
 static
+const char* get_backup_uuid(MYSQL *connection)
+{
+	if (!backup_uuid) {
+		backup_uuid = read_mysql_one_value(connection, "SELECT UUID()");
+	}
+	return backup_uuid;
+}
+
 void
 parse_show_engine_innodb_status(MYSQL *connection)
 {
@@ -435,16 +480,6 @@ get_mysql_vars(MYSQL *connection)
 		have_backup_locks = true;
 	}
 
-	if (opt_binlog_info == BINLOG_INFO_AUTO) {
-
-		if (have_backup_safe_binlog_info_var != NULL)
-			opt_binlog_info = BINLOG_INFO_LOCKLESS;
-		else if (log_bin_var != NULL && !strcmp(log_bin_var, "ON"))
-			opt_binlog_info = BINLOG_INFO_ON;
-		else
-			opt_binlog_info = BINLOG_INFO_OFF;
-	}
-
 	if (have_backup_safe_binlog_info_var == NULL &&
 	    opt_binlog_info == BINLOG_INFO_LOCKLESS) {
 
@@ -485,6 +520,17 @@ get_mysql_vars(MYSQL *connection)
 	if ((gtid_mode_var && strcmp(gtid_mode_var, "ON") == 0) ||
 	    (gtid_slave_pos_var && *gtid_slave_pos_var)) {
 		have_gtid_slave = true;
+	}
+
+	if (opt_binlog_info == BINLOG_INFO_AUTO) {
+
+		if (have_backup_safe_binlog_info_var != NULL &&
+		    !have_gtid_slave)
+			opt_binlog_info = BINLOG_INFO_LOCKLESS;
+		else if (log_bin_var != NULL && !strcmp(log_bin_var, "ON"))
+			opt_binlog_info = BINLOG_INFO_ON;
+		else
+			opt_binlog_info = BINLOG_INFO_OFF;
 	}
 
 	msg("Using server version %s\n", version_var);
@@ -610,8 +656,6 @@ get_mysql_vars(MYSQL *connection)
 	if (tokudb_checkpoint_lock_var != NULL) {
 		have_tokudb = true;
 	}
-
-	parse_show_engine_innodb_status(connection);
 
 out:
 	free_mysql_variables(mysql_vars);
@@ -825,8 +869,10 @@ have_queries_to_wait_for(MYSQL *connection, uint threshold)
 	all_queries = (opt_lock_wait_query_type == QUERY_TYPE_ALL);
 	while ((row = mysql_fetch_row(result)) != NULL) {
 		const char	*info		= row[7];
-		int		duration	= atoi(row[5]);
 		char		*id		= row[0];
+		int		duration;
+
+		duration = (row[5] != NULL) ? atoi(row[5]) : 0;
 
 		if (info != NULL
 		    && duration >= (int)threshold
@@ -964,27 +1010,57 @@ stop_query_killer()
 	os_event_wait_time(kill_query_thread_stopped, 60000);
 }
 
+
+/*********************************************************************//**
+Function acquires a backup tables lock if supported by the server.
+Allows to specify timeout in seconds for attempts to acquire the lock.
+@returns true if lock acquired */
+bool
+lock_tables_for_backup(MYSQL *connection, int timeout)
+{
+	if (have_lock_wait_timeout) {
+		char query[200];
+
+		ut_snprintf(query, sizeof(query),
+			    "SET SESSION lock_wait_timeout=%d", timeout);
+
+		xb_mysql_query(connection, query, false);
+	}
+
+	if (have_backup_locks) {
+		msg_ts("Executing LOCK TABLES FOR BACKUP...\n");
+		xb_mysql_query(connection, "LOCK TABLES FOR BACKUP", true);
+		tables_locked = true;
+		return(true);
+	}
+
+	msg_ts("Error: LOCK TABLES FOR BACKUP is not supported.\n");
+
+	return(false);
+}
+
 /*********************************************************************//**
 Function acquires either a backup tables lock, if supported
 by the server, or a global read lock (FLUSH TABLES WITH READ LOCK)
 otherwise.
 @returns true if lock acquired */
 bool
-lock_tables(MYSQL *connection)
+lock_tables_maybe(MYSQL *connection)
 {
+	if (tables_locked || opt_lock_ddl_per_table) {
+		return(true);
+	}
+
+	if (have_backup_locks) {
+		return lock_tables_for_backup(connection);
+	}
+
 	if (have_lock_wait_timeout) {
 		/* Set the maximum supported session value for
 		lock_wait_timeout to prevent unnecessary timeouts when the
 		global value is changed from the default */
 		xb_mysql_query(connection,
 			"SET SESSION lock_wait_timeout=31536000", false);
-	}
-
-
-	if (have_backup_locks) {
-		msg_ts("Executing LOCK TABLES FOR BACKUP...\n");
-		xb_mysql_query(connection, "LOCK TABLES FOR BACKUP", false);
-		return(true);
 	}
 
 	if (!opt_lock_wait_timeout && !opt_kill_long_queries_timeout) {
@@ -1030,6 +1106,8 @@ lock_tables(MYSQL *connection)
 	if (opt_kill_long_queries_timeout) {
 		stop_query_killer();
 	}
+
+	tables_locked = true;
 
 	return(true);
 }
@@ -1190,14 +1268,26 @@ write_slave_info(MYSQL *connection)
 	char *gtid_executed = NULL;
 	char *position = NULL;
 	char *gtid_slave_pos = NULL;
-	char *ptr;
-	bool result = false;
+	char *auto_position = NULL;
+	char *using_gtid = NULL;
+
+	char *ptr = NULL;
+	char *tmp_mysql_slave_position = NULL;
+	char *writable_channel_name = NULL;
+	const char* channel_info = NULL;
+	bool result = true;
+	const size_t channel_info_maxlen = 128;
+	char channel_info_buf[channel_info_maxlen];
+	ds_file_t	*slave_info_file	= NULL;
 
 	mysql_variable status[] = {
 		{"Master_Host", &master},
 		{"Relay_Master_Log_File", &filename},
 		{"Exec_Master_Log_Pos", &position},
 		{"Executed_Gtid_Set", &gtid_executed},
+		{"Channel_Name", &writable_channel_name},
+		{"Auto_Position", &auto_position},
+		{"Using_Gtid", &using_gtid},
 		{NULL, NULL}
 	};
 
@@ -1205,62 +1295,121 @@ write_slave_info(MYSQL *connection)
 		{"gtid_slave_pos", &gtid_slave_pos},
 		{NULL, NULL}
 	};
-
-	read_mysql_variables(connection, "SHOW SLAVE STATUS", status, false);
 	read_mysql_variables(connection, "SHOW VARIABLES", variables, true);
 
-	if (master == NULL || filename == NULL || position == NULL) {
-		msg("Failed to get master binlog coordinates "
-			"from SHOW SLAVE STATUS\n");
-		msg("This means that the server is not a "
-			"replication slave. Ignoring the --slave-info "
-			"option\n");
-		/* we still want to continue the backup */
-		result = true;
-		goto cleanup;
-	}
-
-	/* Print slave status to a file.
-	If GTID mode is used, construct a CHANGE MASTER statement with
-	MASTER_AUTO_POSITION and correct a gtid_purged value. */
-	if (gtid_executed != NULL && *gtid_executed) {
-		/* MySQL >= 5.6 with GTID enabled */
-
-		for (ptr = strchr(gtid_executed, '\n');
-		     ptr;
-		     ptr = strchr(ptr, '\n')) {
-			*ptr = ' ';
+	MYSQL_RES* slave_status_res = xb_mysql_query(connection,
+		"SHOW SLAVE STATUS", true, true);
+	int masters_count = 0;
+	while (read_mysql_variables_from_result(slave_status_res, status,
+		false)) {
+		if (master == NULL || filename == NULL || position == NULL) {
+			msg("Failed to get master binlog coordinates "
+				"from SHOW SLAVE STATUS\n");
+			msg("This means that the server is not a "
+				"replication slave. Ignoring the --slave-info "
+				"option\n");
+			/* we still want to continue the backup */
+			goto cleanup;
 		}
 
-		result = backup_file_printf(XTRABACKUP_SLAVE_INFO,
-			"SET GLOBAL gtid_purged='%s';\n"
-			"CHANGE MASTER TO MASTER_AUTO_POSITION=1\n",
-			gtid_executed);
+		const char* channel_name = writable_channel_name;
+		if (channel_name && channel_name[0] != '\0') {
+			const char* clause_format = " FOR CHANNEL '%s'";
+			xb_a(channel_info_maxlen >
+				strlen(channel_name) + strlen(clause_format));
+			snprintf(channel_info_buf, channel_info_maxlen,
+				clause_format, channel_name);
+			channel_info = channel_info_buf;
+		} else {
+			channel_name = channel_info = "";
+		}
 
-		ut_a(asprintf(&mysql_slave_position,
-			"master host '%s', purge list '%s'",
-			master, gtid_executed) != -1);
-	} else if (gtid_slave_pos && *gtid_slave_pos) {
-		/* MariaDB >= 10.0 with GTID enabled */
-		result = backup_file_printf(XTRABACKUP_SLAVE_INFO,
-			"SET GLOBAL gtid_slave_pos = '%s';\n"
-			"CHANGE MASTER TO master_use_gtid = slave_pos\n",
-			gtid_slave_pos);
-		ut_a(asprintf(&mysql_slave_position,
-			"master host '%s', gtid_slave_pos %s",
-			master, gtid_slave_pos) != -1);
-	} else {
-		result = backup_file_printf(XTRABACKUP_SLAVE_INFO,
-			"CHANGE MASTER TO MASTER_LOG_FILE='%s', "
-			"MASTER_LOG_POS=%s\n", filename, position);
-		ut_a(asprintf(&mysql_slave_position,
-			"master host '%s', filename '%s', position '%s'",
-			master, filename, position) != -1);
+		if (!slave_info_file) {
+			MY_STAT		 stat;
+			slave_info_file = ds_open(ds_data,
+				XTRABACKUP_SLAVE_INFO, &stat);
+			if (!slave_info_file) {
+				msg("Failed to open %s for writing.",
+					XTRABACKUP_SLAVE_INFO);
+				result = false;
+				goto cleanup;
+			}
+		}
+		++masters_count;
+
+		/* Print slave status to a file.
+		If GTID mode is used, construct a CHANGE MASTER statement with
+		MASTER_AUTO_POSITION and correct a gtid_purged value. */
+		if (auto_position != NULL && !strcmp(auto_position, "1")) {
+			/* MySQL >= 5.6 with GTID enabled */
+
+			for (ptr = strchr(gtid_executed, '\n');
+			     ptr;
+			     ptr = strchr(ptr, '\n')) {
+				*ptr = ' ';
+			}
+
+			if (masters_count == 1) {
+				result &= backup_ds_printf(slave_info_file,
+					"SET GLOBAL gtid_purged='%s';\n",
+					gtid_executed);
+			}
+			result &= backup_ds_printf(slave_info_file,
+				"CHANGE MASTER TO MASTER_AUTO_POSITION=1%s;\n",
+				channel_info);
+
+			ut_a(asprintf(&tmp_mysql_slave_position,
+				"master host '%s', purge list '%s', "
+				"channel name: '%s'",
+				master, gtid_executed, channel_name) != -1);
+		} else if (using_gtid && !strcasecmp(using_gtid, "yes")) {
+			/* MariaDB >= 10.0 with GTID enabled */
+			if (masters_count == 1) {
+				result &= backup_ds_printf(slave_info_file,
+					"SET GLOBAL gtid_slave_pos = '%s';\n",
+					gtid_slave_pos);
+			}
+			result &= backup_ds_printf(slave_info_file,
+				"CHANGE MASTER TO master_use_gtid = slave_pos"
+				"%s;\n",
+				channel_info);
+			ut_a(asprintf(&tmp_mysql_slave_position,
+				"master host '%s', gtid_slave_pos %s, "
+				"channel name: '%s'",
+				master, gtid_slave_pos, channel_name) != -1);
+		} else {
+			result &= backup_ds_printf(slave_info_file,
+				"CHANGE MASTER TO MASTER_LOG_FILE='%s', "
+				"MASTER_LOG_POS=%s%s;\n",
+				filename, position, channel_info);
+			ut_a(asprintf(&tmp_mysql_slave_position,
+				"master host '%s', filename '%s', "
+				"position '%s', channel name: '%s'",
+				master, filename, position,
+				channel_name) != -1);
+		}
+		if (!result) {
+			goto cleanup;
+		}
+		free_mysql_variables(status);
+
+		if (tmp_mysql_slave_position) {
+			mysql_slave_position += '\n';
+			mysql_slave_position += *tmp_mysql_slave_position;
+		}
+		free(tmp_mysql_slave_position);
+		tmp_mysql_slave_position = NULL;
 	}
 
 cleanup:
+	if (slave_info_file) {
+		ds_close(slave_info_file);
+	}
+
+	mysql_free_result(slave_status_res);
 	free_mysql_variables(status);
 	free_mysql_variables(variables);
+	free(tmp_mysql_slave_position);
 
 	return(result);
 }
@@ -1466,48 +1615,35 @@ cleanup:
 	return(result);
 }
 
-
+inline static
+bool format_time(time_t time, char *dest, size_t max_size)
+{
+	tm tm;
+	localtime_r(&time, &tm);
+	return strftime(dest, max_size,
+		 "%Y-%m-%d %H:%M:%S", &tm) != 0;
+}
 
 /*********************************************************************//**
-Writes xtrabackup_info file and if backup_history is enable creates
-PERCONA_SCHEMA.xtrabackup_history and writes a new history record to the
-table containing all the history info particular to the just completed
-backup. */
-bool
-write_xtrabackup_info(MYSQL *connection)
+Allocates and writes contents of xtrabackup_info into buffer;
+Invoke free() on return value once you don't need it.
+*/
+char* get_xtrabackup_info(MYSQL *connection)
 {
-	MYSQL_STMT *stmt;
-	MYSQL_BIND bind[19];
-	char *uuid = NULL;
-	char *server_version = NULL;
-	char buf_start_time[100];
-	char buf_end_time[100];
-	int idx;
-	tm tm;
-	my_bool null = TRUE;
+	const char *uuid = get_backup_uuid(connection);
+	char *server_version = read_mysql_one_value(connection, "SELECT VERSION()");
 
-	const char *xb_stream_name[] = {"file", "tar", "xbstream"};
-	const char *ins_query = "insert into PERCONA_SCHEMA.xtrabackup_history("
-		"uuid, name, tool_name, tool_command, tool_version, "
-		"ibbackup_version, server_version, start_time, end_time, "
-		"lock_time, binlog_pos, innodb_from_lsn, innodb_to_lsn, "
-		"partial, incremental, format, compact, compressed, "
-		"encrypted) "
-		"values(?,?,?,?,?,?,?,from_unixtime(?),from_unixtime(?),"
-		"?,?,?,?,?,?,?,?,?,?)";
+	static const size_t time_buf_size = 100;
+	char buf_start_time[time_buf_size];
+	char buf_end_time[time_buf_size];
 
-	ut_ad(xtrabackup_stream_fmt < 3);
+	format_time(history_start_time, buf_start_time, time_buf_size);
+	format_time(history_end_time, buf_end_time, time_buf_size);
 
-	uuid = read_mysql_one_value(connection, "SELECT UUID()");
-	server_version = read_mysql_one_value(connection, "SELECT VERSION()");
-	localtime_r(&history_start_time, &tm);
-	strftime(buf_start_time, sizeof(buf_start_time),
-		 "%Y-%m-%d %H:%M:%S", &tm);
-	history_end_time = time(NULL);
-	localtime_r(&history_end_time, &tm);
-	strftime(buf_end_time, sizeof(buf_end_time),
-		 "%Y-%m-%d %H:%M:%S", &tm);
-	backup_file_printf(XTRABACKUP_INFO,
+	ut_a(uuid);
+	ut_a(server_version);
+	char* result = NULL;
+	asprintf(&result,
 		"uuid = %s\n"
 		"name = %s\n"
 		"tool_name = %s\n"
@@ -1517,10 +1653,10 @@ write_xtrabackup_info(MYSQL *connection)
 		"server_version = %s\n"
 		"start_time = %s\n"
 		"end_time = %s\n"
-		"lock_time = %d\n"
+		"lock_time = %ld\n"
 		"binlog_pos = %s\n"
-		"innodb_from_lsn = %llu\n"
-		"innodb_to_lsn = %llu\n"
+		"innodb_from_lsn = " LSN_PF "\n"
+		"innodb_to_lsn = " LSN_PF "\n"
 		"partial = %s\n"
 		"incremental = %s\n"
 		"format = %s\n"
@@ -1536,7 +1672,7 @@ write_xtrabackup_info(MYSQL *connection)
 		server_version,  /* server_version */
 		buf_start_time,  /* start_time */
 		buf_end_time,  /* end_time */
-		history_lock_time, /* lock_time */
+		(long int)history_lock_time, /* lock_time */
 		mysql_binlog_position ?
 			mysql_binlog_position : "", /* binlog_pos */
 		incremental_lsn, /* innodb_from_lsn */
@@ -1548,14 +1684,59 @@ write_xtrabackup_info(MYSQL *connection)
 		 || xtrabackup_databases_exclude
 		 || xtrabackup_databases_file) ? "Y" : "N",
 		xtrabackup_incremental ? "Y" : "N", /* incremental */
-		xb_stream_name[xtrabackup_stream_fmt], /* format */
+		xb_stream_format_name[xtrabackup_stream_fmt], /* format */
 		xtrabackup_compact ? "Y" : "N", /* compact */
 		xtrabackup_compress ? "compressed" : "N", /* compressed */
 		xtrabackup_encrypt ? "Y" : "N"); /* encrypted */
 
+	free(server_version);
+	return result;
+}
+
+
+
+/*********************************************************************//**
+Writes xtrabackup_info file and if backup_history is enable creates
+PERCONA_SCHEMA.xtrabackup_history and writes a new history record to the
+table containing all the history info particular to the just completed
+backup. */
+bool
+write_xtrabackup_info(MYSQL *connection)
+{
+	MYSQL_STMT *stmt;
+	MYSQL_BIND bind[19];
+	const char *uuid = NULL;
+	char *server_version = NULL;
+	char* xtrabackup_info_data = NULL;
+	int idx;
+	my_bool null = TRUE;
+
+	const char *ins_query = "insert into PERCONA_SCHEMA.xtrabackup_history("
+		"uuid, name, tool_name, tool_command, tool_version, "
+		"ibbackup_version, server_version, start_time, end_time, "
+		"lock_time, binlog_pos, innodb_from_lsn, innodb_to_lsn, "
+		"partial, incremental, format, compact, compressed, "
+		"encrypted) "
+		"values(?,?,?,?,?,?,?,from_unixtime(?),from_unixtime(?),"
+		"?,?,?,?,?,?,?,?,?,?)";
+
+	ut_ad((uint)xtrabackup_stream_fmt <
+		array_elements(xb_stream_format_name));
+	const char *stream_format_name =
+		xb_stream_format_name[xtrabackup_stream_fmt];
+	history_end_time = time(NULL);
+
+	xtrabackup_info_data = get_xtrabackup_info(connection);
+	if (!backup_file_printf(XTRABACKUP_INFO, "%s", xtrabackup_info_data)) {
+		goto cleanup;
+	}
+
 	if (!opt_history) {
 		goto cleanup;
 	}
+
+	uuid = get_backup_uuid(connection);
+	server_version = read_mysql_one_value(connection, "SELECT VERSION()");
 
 	xb_mysql_query(connection,
 		"CREATE DATABASE IF NOT EXISTS PERCONA_SCHEMA", false);
@@ -1591,7 +1772,7 @@ write_xtrabackup_info(MYSQL *connection)
 
 	/* uuid */
 	bind[idx].buffer_type = MYSQL_TYPE_STRING;
-	bind[idx].buffer = uuid;
+	bind[idx].buffer = (char*)uuid;
 	bind[idx].buffer_length = strlen(uuid);
 	++idx;
 
@@ -1692,8 +1873,8 @@ write_xtrabackup_info(MYSQL *connection)
 
 	/* format (file | tar | xbstream) */
 	bind[idx].buffer_type = MYSQL_TYPE_STRING;
-	bind[idx].buffer = (char*)(xb_stream_name[xtrabackup_stream_fmt]);
-	bind[idx].buffer_length = strlen(xb_stream_name[xtrabackup_stream_fmt]);
+	bind[idx].buffer = (char*)(stream_format_name);
+	bind[idx].buffer_length = strlen(stream_format_name);
 	++idx;
 
 	/* compact (Y | N) */
@@ -1723,7 +1904,7 @@ write_xtrabackup_info(MYSQL *connection)
 
 cleanup:
 
-	free(uuid);
+	free(xtrabackup_info_data);
 	free(server_version);
 
 	return(true);
@@ -1842,11 +2023,84 @@ Deallocate memory, disconnect from MySQL server, etc.
 void
 backup_cleanup()
 {
-	free(mysql_slave_position);
 	free(mysql_binlog_position);
 	free(buffer_pool_filename);
+	free(backup_uuid);
+	backup_uuid = NULL;
 
 	if (mysql_connection) {
 		mysql_close(mysql_connection);
 	}
 }
+
+static ib_mutex_t mdl_lock_con_mutex;
+static MYSQL *mdl_con = NULL;
+
+void
+mdl_lock_init()
+{
+	mutex_create(LATCH_ID_XTRA_DATAFILES_ITER_MUTEX, &mdl_lock_con_mutex);
+
+	mdl_con = xb_mysql_connect();
+
+	if (mdl_con != NULL) {
+		xb_mysql_query(mdl_con, "BEGIN", false, true);
+	}
+}
+
+
+void
+mdl_lock_table(ulint space_id)
+{
+	MYSQL_RES *mysql_result = NULL;
+	MYSQL_ROW row;
+	char *query;
+
+	mutex_enter(&mdl_lock_con_mutex);
+
+	xb_a(asprintf(&query,
+		"SELECT NAME FROM INFORMATION_SCHEMA.INNODB_SYS_TABLES "
+		"WHERE SPACE = %lu", space_id));
+
+	xb_mysql_query(mdl_con, query, true, true);
+
+	mysql_result = xb_mysql_query(mdl_con, query, true);
+
+	while ((row = mysql_fetch_row(mysql_result))) {
+		char *table_name = strdup(row[0]);
+		char *separator = strchr(table_name, '/');
+		char *lock_query;
+
+		if (separator != NULL) {
+			*separator = '.';
+		}
+
+		msg_ts("Locking MDL for %s\n", table_name);
+
+		xb_a(asprintf(&lock_query,
+			"SELECT * FROM %s LIMIT 1",
+			table_name));
+
+		xb_mysql_query(mdl_con, lock_query, false, false);
+
+		free(lock_query);
+		free(table_name);
+	}
+
+	mysql_free_result(mysql_result);
+	free(query);
+
+	mutex_exit(&mdl_lock_con_mutex);
+}
+
+
+void
+mdl_unlock_all()
+{
+	msg_ts("Unlocking MDL for all tables");
+
+	xb_mysql_query(mdl_con, "COMMIT", false, true);
+
+	mutex_free(&mdl_lock_con_mutex);
+}
+

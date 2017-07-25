@@ -918,6 +918,20 @@ buf_flush_init_for_writing(
 					reset_type = FIL_PAGE_TYPE_TRX_SYS;
 				}
 				break;
+			case 3:
+			case 6:
+			case 7:
+				if (block->page.id.page_no() < 16384 &&
+				    block->page.id.space() == TRX_SYS_SPACE) {
+					reset_type = FIL_PAGE_TYPE_SYS;
+				}
+				break;
+			case 4:
+				if (block->page.id.page_no() == 4 &&
+				    block->page.id.space() == TRX_SYS_SPACE) {
+					reset_type = FIL_PAGE_INDEX;
+				}
+				break;
 			default:
 				switch (page_type) {
 				case FIL_PAGE_INDEX:
@@ -3371,7 +3385,7 @@ DECLARE_THREAD(buf_flush_page_cleaner_coordinator)(
 
 	ut_ad(srv_shutdown_state > 0);
 	if (srv_fast_shutdown == 2
-	    || srv_shutdown_state < SRV_SHUTDOWN_FLUSH_PHASE) {
+	    || srv_shutdown_state == SRV_SHUTDOWN_EXIT_THREADS) {
 		/* In very fast shutdown or when innodb failed to start, we
 		simulate a crash of the buffer pool. We are not required to do
 		any flushing. */
