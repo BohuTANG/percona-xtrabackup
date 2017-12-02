@@ -166,6 +166,11 @@ MYSQL_ADD_EXECUTABLE(xbcrypt
   xbcrypt_common.c
   xbcrypt_read.c
   xbcrypt_write.c
+  datasink.c
+  ds_encrypt.c
+  ds_decrypt.c
+  ds_local.c
+  ds_stdout.c
   )
 
 SET_TARGET_PROPERTIES(xbcrypt
@@ -182,12 +187,17 @@ TARGET_LINK_LIBRARIES(xbcrypt
 ########################################################################
 # xbcloud binary
 ########################################################################
+MY_CHECK_C_COMPILER_FLAG("-Werror=format-truncation=0" HAVE_WFORMAT_TRUNCATION)
+IF(HAVE_WFORMAT_TRUNCATION)
+  SET(WARNING_FLAGS "-Werror=format-truncation=0")
+ENDIF()
 MYSQL_ADD_EXECUTABLE(xbcloud
   xbcloud.cc
   )
 
 SET_TARGET_PROPERTIES(xbcloud
         PROPERTIES LINKER_LANGUAGE CXX
+        COMPILE_FLAGS "${WARNING_FLAGS}"
         )
 
 TARGET_LINK_LIBRARIES(xbcloud

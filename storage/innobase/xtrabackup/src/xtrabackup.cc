@@ -262,7 +262,7 @@ long innobase_file_io_threads = 4;
 long innobase_read_io_threads = 4;
 long innobase_write_io_threads = 4;
 long innobase_force_recovery = 0;
-long innobase_log_buffer_size = 1024*1024L;
+long innobase_log_buffer_size = 16*1024*1024L;
 long innobase_log_files_in_group = 2;
 long innobase_open_files = 300L;
 
@@ -420,6 +420,7 @@ uint opt_lock_ddl_timeout = 0;
 
 const char *opt_history = NULL;
 my_bool opt_decrypt = FALSE;
+uint opt_read_buffer_size = 0;
 
 const char *ssl_mode_names_lib[] =
   {"DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY",
@@ -677,6 +678,7 @@ enum options_xtrabackup
 
   OPT_XTRA_TABLES_COMPATIBILITY_CHECK,
   OPT_XTRA_CHECK_PRIVILEGES,
+  OPT_XTRA_READ_BUFFER_SIZE,
 };
 
 struct my_option xb_client_options[] =
@@ -1109,6 +1111,15 @@ struct my_option xb_client_options[] =
     "privileges before performing any query.", &opt_check_privileges,
    &opt_check_privileges, 0, GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
 
+  {"read_buffer_size",
+   OPT_XTRA_READ_BUFFER_SIZE,
+   "Set datafile read buffer size, given value is scaled up to page size."
+   " Default is 10Mb.",
+   &opt_read_buffer_size,
+   &opt_read_buffer_size,
+   0, GET_UINT, OPT_ARG, 10*1024*1024,
+   UNIV_PAGE_SIZE_MAX, UINT_MAX, 0, UNIV_PAGE_SIZE_MAX, 0},
+
 #include "sslopt-longopts.h"
 
 #if !defined(HAVE_YASSL)
@@ -1225,7 +1236,7 @@ Disable with --skip-innodb-doublewrite.", (G_PTR*) &innobase_use_doublewrite,
   {"innodb_log_buffer_size", OPT_INNODB_LOG_BUFFER_SIZE,
    "The size of the buffer which InnoDB uses to write log to the log files on disk.",
    (G_PTR*) &innobase_log_buffer_size, (G_PTR*) &innobase_log_buffer_size, 0,
-   GET_LONG, REQUIRED_ARG, 1024*1024L, 256*1024L, LONG_MAX, 0, 1024, 0},
+   GET_LONG, REQUIRED_ARG, 16*1024*1024L, 256*1024L, LONG_MAX, 0, 1024, 0},
   {"innodb_log_file_size", OPT_INNODB_LOG_FILE_SIZE,
    "Size of each log file in a log group.",
    (G_PTR*) &innobase_log_file_size, (G_PTR*) &innobase_log_file_size, 0,
@@ -1404,7 +1415,7 @@ static void usage(void)
 {
   puts("Open source backup tool for InnoDB and XtraDB\n\
 \n\
-Copyright (C) 2009-2015 Percona LLC and/or its affiliates.\n\
+Copyright (C) 2009-2017 Percona LLC and/or its affiliates.\n\
 Portions Copyright (C) 2000, 2011, MySQL AB & Innobase Oy. All Rights Reserved.\n\
 \n\
 This program is free software; you can redistribute it and/or\n\
@@ -5898,10 +5909,6 @@ xb_space_create_file(
 			return(false);
 		}
 
-		if (error == OS_FILE_DISK_FULL) {
-			return(DB_OUT_OF_FILE_SPACE);
-		}
-
 		return(false);
 	}
 
@@ -6554,8 +6561,7 @@ next_file_item_1:
 		        goto next_datadir_item;
 		}
 
-		sprintf(dbpath, "%s/%s", path,
-								dbinfo.name);
+		fn_format(dbpath, dbinfo.name, path, "", MYF(0));
 		os_normalize_path(dbpath);
 
 		dbdir = os_file_opendir(dbpath, false);

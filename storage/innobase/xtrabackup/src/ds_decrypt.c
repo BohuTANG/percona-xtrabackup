@@ -68,7 +68,8 @@ typedef struct {
 	size_t			buf_size;
 } ds_decrypt_file_t;
 
-int		ds_decrypt_encrypt_threads = 1;
+uint		ds_decrypt_encrypt_threads = 1;
+my_bool	ds_decrypt_modify_file_extension = TRUE;
 
 static ds_ctxt_t *decrypt_init(const char *root);
 static ds_file_t *decrypt_open(ds_ctxt_t *ctxt, const char *path,
@@ -133,6 +134,8 @@ decrypt_open(ds_ctxt_t *ctxt, const char *path, MY_STAT *mystat)
 	ds_decrypt_file_t	*crypt_file;
 
 	char			new_name[FN_REFLEN];
+	const char		*used_name = path;
+	char			*xbcrypt_ext_pos;
 	ds_file_t		*file;
 
 	xb_ad(ctxt->pipe_ctxt != NULL);
@@ -148,12 +151,26 @@ decrypt_open(ds_ctxt_t *ctxt, const char *path, MY_STAT *mystat)
 
 	crypt_file = (ds_decrypt_file_t *) (file + 1);
 
-	/* Remove the .xbcrypt extension from the filename */
-	strncpy(new_name, path, FN_REFLEN);
-	new_name[strlen(new_name) - 8] = 0;
-	crypt_file->dest_file = ds_open(dest_ctxt, new_name, mystat);
+	/* xtrabackup and xbstream rely on fact that extension is appended on
+	   encryption and removed on decryption.
+	   That works well with piping compression and excryption datasinks,
+	   hinting on how to access contents of the file when it is needed.
+	   However, xbcrypt (and its users) does not expect such magic,
+	   and extension is set manually by the user or caller script.
+	   Here implicit extension modification causes more trouble than good.
+
+	   See also ds_encrypt_modify_file_extension . */
+	if (ds_decrypt_modify_file_extension) {
+		/* Remove the .xbcrypt extension from the filename */
+		if ((xbcrypt_ext_pos = strstr(path, ".xbcrypt"))) {
+			strncpy(new_name, path, xbcrypt_ext_pos - path);
+			new_name[xbcrypt_ext_pos - path] = 0;
+			used_name = new_name;
+		}
+	}
+	crypt_file->dest_file = ds_open(dest_ctxt, used_name, mystat);
 	if (crypt_file->dest_file == NULL) {
-		msg("decrypt: ds_open(\"%s\") failed.\n", new_name);
+		msg("decrypt: ds_open(\"%s\") failed.\n", used_name);
 		goto err;
 	}
 
@@ -341,13 +358,15 @@ decrypt_write(ds_file_t *file, const void *buf, size_t len)
 	nthreads = crypt_ctxt->nthreads;
 
 	if (crypt_file->buf_len > 0) {
+		const size_t remainder = crypt_file->buf_len;
+		size_t new_data_size = 0;
 		thd = threads;
 
 		pthread_mutex_lock(&thd->ctrl_mutex);
-
 		do {
-			if (parse_result == XB_CRYPT_READ_INCOMPLETE) {
-				crypt_file->buf_size = crypt_file->buf_size * 2;
+			if (parse_result == XB_CRYPT_READ_INCOMPLETE
+			    || crypt_file->buf_size == remainder) {
+				crypt_file->buf_size *= 2;
 				crypt_file->buf = (uchar *) my_realloc(
 						PSI_NOT_INSTRUMENTED,
 						crypt_file->buf,
@@ -355,13 +374,16 @@ decrypt_write(ds_file_t *file, const void *buf, size_t len)
 						MYF(MY_FAE|MY_ALLOW_ZERO_PTR));
 			}
 
-			memcpy(crypt_file->buf + crypt_file->buf_len,
-			       buf, MY_MIN(crypt_file->buf_size -
-					   crypt_file->buf_len, len));
+			new_data_size = MY_MIN(crypt_file->buf_size -
+					       remainder, len);
+			xb_ad(new_data_size > 0u);
+			memcpy(crypt_file->buf + remainder, buf,
+			       new_data_size);
 
 			parse_result = parse_xbcrypt_chunk(
 				thd, crypt_file->buf,
-				crypt_file->buf_size, &bytes_processed);
+				remainder + new_data_size,
+				&bytes_processed);
 
 			if (parse_result == XB_CRYPT_READ_ERROR) {
 				pthread_mutex_unlock(&thd->ctrl_mutex);
@@ -369,10 +391,19 @@ decrypt_write(ds_file_t *file, const void *buf, size_t len)
 			}
 
 		} while (parse_result == XB_CRYPT_READ_INCOMPLETE &&
-			 crypt_file->buf_size < len);
+			 crypt_file->buf_size < remainder + len);
+		crypt_file->buf_len += new_data_size;
+
+		/* Give caller a chance to supply remaining data in subsequent
+		invocations, closing a file will report an error if there is
+		still some buffered data left unprocessed. */
+		if (parse_result == XB_CRYPT_READ_INCOMPLETE) {
+			pthread_mutex_unlock(&thd->ctrl_mutex);
+			return 0;
+		}
 
 		if (parse_result != XB_CRYPT_READ_CHUNK) {
-			msg("decrypt: incomplete data.\n");
+			msg("decrypt: failed to decrypt.\n");
 			pthread_mutex_unlock(&thd->ctrl_mutex);
 			return 1;
 		}
@@ -382,8 +413,9 @@ decrypt_write(ds_file_t *file, const void *buf, size_t len)
 		pthread_cond_signal(&thd->data_cond);
 		pthread_mutex_unlock(&thd->data_mutex);
 
-		len -= bytes_processed - crypt_file->buf_len;
-		buf += bytes_processed - crypt_file->buf_len;
+		xb_ad(bytes_processed > remainder);
+		len -= bytes_processed - remainder;
+		buf += bytes_processed - remainder;
 
 		/* reap */
 
@@ -518,7 +550,15 @@ decrypt_close(ds_file_t *file)
 	crypt_file = (ds_decrypt_file_t *) file->ptr;
 	dest_file = crypt_file->dest_file;
 
+	if (crypt_file->buf_len != 0) {
+		msg("decrypt: incomplete data, "
+		    "%zu bytes are still not decrypted.\n",
+		    crypt_file->buf_len);
+		rc = 2;
+	}
+
 	if (ds_close(dest_file)) {
+		msg("decrypt: failed to close dest file.\n");
 		rc = 1;
 	}
 

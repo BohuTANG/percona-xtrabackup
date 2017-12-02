@@ -29,6 +29,20 @@ Options
    ``OFF``, ``ON``, ``LOCKLESS`` and ``AUTO``. See the |Percona XtraBackup|
    :ref:`lockless_bin-log`  manual page for more information.
 
+.. option:: --check-privileges
+
+   This option checks if |Percona XtraBackup| has all required privileges.
+   If a missing privilege is required for the current operation,
+   it will terminate and print out an error message.
+   If a missing privilege is not required for the current operation,
+   but may be necessary for some other XtraBackup operation,
+   the process is not aborted and a warning is printed.
+
+   .. code-block:: bash
+
+     xtrabackup: Error: missing required privilege LOCK TABLES on *.*
+     xtrabackup: Warning: missing required privilege REPLICATION CLIENT on *.*
+
 .. option:: --close-files
 
    Do not keep files opened. When |xtrabackup| opens tablespace it normally
@@ -185,7 +199,7 @@ Options
 .. option:: --extra-lsndir=DIRECTORY
 
    (for --backup): save an extra copy of the :file:`xtrabackup_checkpoints`
-   file in this directory.
+   and :file:`xtrabackup_info` files in this directory.
 
 .. option:: --force-non-empty-directories
 
@@ -303,6 +317,21 @@ Options
 .. option:: --keyring-file-data=FILENAME
 
    The path to the keyring file.
+
+.. option:: --lock-ddl
+
+   Issue ``LOCK TABLES FOR BACKUP`` if it is supported by server
+   at the beginning of the backup to block all DDL operations.
+
+.. option:: --lock-ddl-per-table
+
+   Lock DDL for each table before xtrabackup starts to copy
+   it and until the backup is completed.
+
+.. option:: --lock-ddl-timeout
+
+   If ``LOCK TABLES FOR BACKUP`` does not return within given
+   timeout, abort the backup.
 
 .. option:: --log-copy-interval=#
 

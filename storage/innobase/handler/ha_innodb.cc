@@ -2017,7 +2017,14 @@ innobase_get_cset_width(
 			}
 		} else {
 
-			ut_a(cset == 0);
+			if (cset != 0) {
+				/* Since we don't do anything fancy with the
+				data itself, it is safe to ignore missing
+				collation. (special case for collation that
+				isn't supported in vanilla MySQL) */
+				ib::warn() << "Unknown collation " << cset
+					   << ".";
+			}
 		}
 
 		*mbminlen = *mbmaxlen = 0;
@@ -11314,6 +11321,7 @@ index_bad:
 			m_thd, Sql_condition::SL_WARNING,
 			ER_ILLEGAL_HA_CREATE_OPTION,
 			"InnoDB: assuming ROW_FORMAT=DYNAMIC.");
+		// Fall through.
 	case ROW_TYPE_DYNAMIC:
 		innodb_row_format = REC_FORMAT_DYNAMIC;
 		break;
