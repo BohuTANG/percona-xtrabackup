@@ -850,7 +850,7 @@ ibx_get_one_option(int optid,
 		exit(0);
 		break;
 	case 'v':
-		msg("innobackupex version %s %s (%s) (revision id: %s)\n",
+		msg("innobackupex version %s %s (%s) (XeLabs build revision id: %s)\n",
 			XTRABACKUP_VERSION,
 			SYSTEM_TYPE, MACHINE_TYPE, XTRABACKUP_REVISION);
 		exit(0);

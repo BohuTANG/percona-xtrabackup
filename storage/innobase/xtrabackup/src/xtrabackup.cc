@@ -1406,7 +1406,7 @@ static const char *xb_server_default_groups[]=
 
 static void print_version(void)
 {
-  msg("%s version %s based on MySQL server %s %s (%s) (revision id: %s)\n",
+  msg("%s version %s based on MySQL server %s %s (%s) (XeLabs build revision id: %s)\n",
       my_progname, XTRABACKUP_VERSION, MYSQL_SERVER_VERSION, SYSTEM_TYPE,
       MACHINE_TYPE, XTRABACKUP_REVISION);
 }
