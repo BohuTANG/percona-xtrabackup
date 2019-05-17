@@ -679,6 +679,8 @@ get_mysql_vars(MYSQL *connection)
 	/* TokuDB plugin check via tokudb_checkpoint_lock */
 	if (tokudb_checkpoint_lock_var != NULL) {
 		have_tokudb = true;
+        }
+
 	memset(server_uuid, 0, ENCRYPTION_SERVER_UUID_LEN + 1);
 	if (server_uuid_var != NULL) {
 		strncpy(server_uuid, server_uuid_var,
