@@ -11,12 +11,18 @@ start_server_with_tokudb
 mysql <<EOF
 CREATE DATABASE testdb;
 CREATE TABLE testdb.t (a INT PRIMARY KEY) ENGINE=TokuDB;
+CREATE TABLE testdb.tt (a INT PRIMARY KEY) ENGINE=Memory;
 INSERT INTO testdb.t VALUES (1), (2), (3);
 EOF
 
 vlog "Checking that warning is printed out"
 xtrabackup --backup --target-dir=$topdir/backup 2>&1 | tee $topdir/pxb.log
-if ! grep -q 'Warning: "testdb.t" uses engine "TokuDB" and will not be backed up.' $topdir/pxb.log
+if grep -q 'Warning: "testdb.t" uses engine "TokuDB" and will not be backed up.' $topdir/pxb.log
+then
+	die "xtrabackup should not print a warning."
+fi
+
+if ! grep -q 'Warning: "testdb.tt" uses engine "Memory" and will not be backed up.' $topdir/pxb.log
 then
 	die "xtrabackup should print a warning."
 fi
@@ -34,6 +40,11 @@ then
 	die "xtrabackup should NOT print a warning."
 fi
 
+if grep -q 'Warning: "testdb.tt" uses engine "Memory" and will not be backed up.' $topdir/pxb.log
+then
+	die "xtrabackup should NOT print a warning."
+fi
+
 run_cmd rm -rf $topdir/backup
 
 vlog "No warning when TokuDB table is not backed up"
@@ -43,6 +54,11 @@ xtrabackup --backup \
 	| tee $topdir/pxb.log
 
 if grep -q 'Warning: "testdb.t" uses engine "TokuDB" and will not be backed up.' $topdir/pxb.log
+then
+	die "xtrabackup should NOT print a warning."
+fi
+
+if grep -q 'Warning: "testdb.tt" uses engine "Memory" and will not be backed up.' $topdir/pxb.log
 then
 	die "xtrabackup should NOT print a warning."
 fi
