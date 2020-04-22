@@ -20,6 +20,7 @@ call mtr.add_suppression("Slave: Could not start slave for channel");
 call mtr.add_suppression("Error during --relay-log-recovery: Could not locate rotate event from the master");
 call mtr.add_suppression("slave with the same server_uuid as this slave has connected to the master");
 call mtr.add_suppression("Failed to create or recover replication info repositories");
+call mtr.add_suppression("Got fatal error .* from master .* slave with the same server_uuid/server_id");
 --source include/stop_slave.inc
 
 # On the slave
@@ -83,6 +84,7 @@ RESET SLAVE ALL FOR CHANNEL 'ch1';
 START SLAVE;
 
 # clean up
+--let $slave_io_errno= convert_error(ER_MASTER_FATAL_ERROR_READING_BINLOG)
 --source include/stop_slave.inc
 RESET SLAVE ALL;
 --replace_result $save_mi_repo_type SAVE_MI_REPO_TYPE

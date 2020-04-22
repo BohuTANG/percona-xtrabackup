@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2016, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -31,6 +31,7 @@
 
 /* Global Thread counter */
 uint counter;
+native_mutex_t init_mutex;
 native_mutex_t counter_mutex;
 native_cond_t count_threshold;
 
@@ -58,6 +59,7 @@ static char * opt_mysql_unix_port=0;
 static char *opt_plugin_dir= 0, *opt_default_auth= 0;
 static longlong opt_ignore_lines= -1;
 #include <sslopt-vars.h>
+#include <caching_sha2_passwordopt-vars.h>
 
 #if defined (_WIN32) && !defined (EMBEDDED_LIBRARY)
 static char *shared_memory_base_name=0;
@@ -186,6 +188,7 @@ static struct my_option my_long_options[] =
    &opt_mysql_unix_port, &opt_mysql_unix_port, 0, GET_STR,
    REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
 #include <sslopt-longopts.h>
+#include <caching_sha2_passwordopt-longopts.h>
   {"use-threads", OPT_USE_THREADS,
    "Load files in parallel. The argument is the number "
    "of threads to use for loading data.",
@@ -454,8 +457,19 @@ static MYSQL *db_connect(char *host, char *database,
   MYSQL *mysql;
   if (verbose)
     fprintf(stdout, "Connecting to %s\n", host ? host : "localhost");
-  if (!(mysql= mysql_init(NULL)))
-    return 0;
+  if (opt_use_threads && !lock_tables)
+  {
+    native_mutex_lock(&init_mutex);
+    if (!(mysql= mysql_init(NULL)))
+    {
+      native_mutex_unlock(&init_mutex);
+      return 0;
+    }
+    native_mutex_unlock(&init_mutex);
+  }
+  else
+    if (!(mysql= mysql_init(NULL)))
+      return 0;
   if (opt_compress)
     mysql_options(mysql,MYSQL_OPT_COMPRESS,NullS);
   if (opt_local_file)
@@ -485,6 +499,10 @@ static MYSQL *db_connect(char *host, char *database,
   mysql_options(mysql, MYSQL_OPT_CONNECT_ATTR_RESET, 0);
   mysql_options4(mysql, MYSQL_OPT_CONNECT_ATTR_ADD,
                  "program_name", "mysqlimport");
+
+  set_server_public_key(mysql);
+  set_get_server_public_key_option(mysql);
+
   if (!(mysql_real_connect(mysql,host,user,passwd,
                            database,opt_mysql_port,opt_mysql_unix_port,
                            0)))
@@ -628,7 +646,7 @@ error:
   native_cond_signal(&count_threshold);
   native_mutex_unlock(&counter_mutex);
   mysql_thread_end();
-
+  my_thread_exit(0);
   return 0;
 }
 
@@ -654,13 +672,30 @@ int main(int argc, char **argv)
 
   if (opt_use_threads && !lock_tables)
   {
-    my_thread_handle mainthread;            /* Thread descriptor */
-    my_thread_attr_t attr;          /* Thread attributes */
+    char **save_argv;
+    uint worker_thread_count= 0, table_count= 0, i= 0;
+    my_thread_handle *worker_threads;       /* Thread descriptor */
+    my_thread_attr_t attr;                  /* Thread attributes */
     my_thread_attr_init(&attr);
-    my_thread_attr_setdetachstate(&attr, MY_THREAD_CREATE_DETACHED);
+    my_thread_attr_setdetachstate(&attr, MY_THREAD_CREATE_JOINABLE);
 
+    native_mutex_init(&init_mutex, NULL);
     native_mutex_init(&counter_mutex, NULL);
     native_cond_init(&count_threshold);
+
+    /* Count the number of tables. This number denotes the total number
+       of threads spawn.
+    */
+    save_argv= argv;
+    for (table_count= 0; *argv != NULL; argv++)
+      table_count++;
+    argv= save_argv;
+
+    if (!(worker_threads= (my_thread_handle*) my_malloc(PSI_NOT_INSTRUMENTED,
+                                              table_count *
+                                              sizeof(*worker_threads),
+                                              MYF(0))))
+      return -2;
 
     for (counter= 0; *argv != NULL; argv++) /* Loop through tables */
     {
@@ -676,15 +711,16 @@ int main(int argc, char **argv)
       counter++;
       native_mutex_unlock(&counter_mutex);
       /* now create the thread */
-      if (my_thread_create(&mainthread, &attr, worker_thread, 
-                           (void *)*argv) != 0)
+      if (my_thread_create(&worker_threads[worker_thread_count], &attr,
+                           worker_thread, (void *)*argv) != 0)
       {
         native_mutex_lock(&counter_mutex);
         counter--;
         native_mutex_unlock(&counter_mutex);
-        fprintf(stderr,"%s: Could not create thread\n",
-                my_progname);
+        fprintf(stderr,"%s: Could not create thread\n", my_progname);
+        continue;
       }
+      worker_thread_count++;
     }
 
     /*
@@ -699,9 +735,18 @@ int main(int argc, char **argv)
       native_cond_timedwait(&count_threshold, &counter_mutex, &abstime);
     }
     native_mutex_unlock(&counter_mutex);
+    native_mutex_destroy(&init_mutex);
     native_mutex_destroy(&counter_mutex);
     native_cond_destroy(&count_threshold);
     my_thread_attr_destroy(&attr);
+
+    for(i= 0; i < worker_thread_count; i++)
+    {
+      if (my_thread_join(&worker_threads[i], NULL))
+        fprintf(stderr,"%s: Could not join worker thread.\n", my_progname);
+    }
+
+    my_free(worker_threads);
   }
   else
   {

@@ -1,4 +1,4 @@
-/* Copyright (c) 2005, 2015, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2005, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -2028,8 +2028,10 @@ void truncate_partition_filename(MEM_ROOT *root, const char **path)
   {
     const char* last_slash= strrchr(*path, FN_LIBCHAR);
 
+#ifdef _WIN32
     if (!last_slash)
       last_slash= strrchr(*path, FN_LIBCHAR2);
+#endif
 
     if (last_slash)
     {
@@ -4911,8 +4913,6 @@ bool compare_partition_options(HA_CREATE_INFO *table_create_info,
     option_diffs[errors++]= "MAX_ROWS";
   if (part_elem->part_min_rows != table_create_info->min_rows)
     option_diffs[errors++]= "MIN_ROWS";
-  if (part_elem->data_file_name || table_create_info->data_file_name)
-    option_diffs[errors++]= "DATA DIRECTORY";
   if (part_elem->index_file_name || table_create_info->index_file_name)
     option_diffs[errors++]= "INDEX DIRECTORY";
 

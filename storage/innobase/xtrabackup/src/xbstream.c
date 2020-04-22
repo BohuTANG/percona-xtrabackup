@@ -1,5 +1,5 @@
 /******************************************************
-Copyright (c) 2011-2013 Percona LLC and/or its affiliates.
+Copyright (c) 2011-2020 Percona LLC and/or its affiliates.
 
 The xbstream utility: serialize/deserialize files in the XBSTREAM format.
 
@@ -63,7 +63,7 @@ static my_bool		opt_verbose = 0;
 static int		opt_parallel = 1;
 static ulong 		opt_encrypt_algo;
 static char 		*opt_encrypt_key_file = NULL;
-static void 		*opt_encrypt_key = NULL;
+static char 		*opt_encrypt_key = NULL;
 static int		opt_encrypt_threads = 1;
 
 enum {
@@ -90,8 +90,7 @@ static struct my_option my_long_options[] =
 	{"decrypt", 'd', "Decrypt files ending with .xbcrypt.",
 	 &opt_encrypt_algo, &opt_encrypt_algo, &xbstream_encrypt_algo_typelib,
 	 GET_ENUM, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
-	{"encrypt-key", 'k', "Encryption key.",
-	 &opt_encrypt_key, &opt_encrypt_key, 0,
+	{"encrypt-key", 'k', "Encryption key", 0, 0, 0,
 	 GET_STR_ALLOC, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
 	{"encrypt-key-file", 'f', "File which contains encryption key.",
 	 &opt_encrypt_key_file, &opt_encrypt_key_file, 0,
@@ -132,11 +131,13 @@ main(int argc, char **argv)
 {
 	MY_INIT(argv[0]);
 
-	crc_init();
-
 	if (get_options(&argc, &argv)) {
 		goto err;
 	}
+
+	xb_libgcrypt_init();
+
+	crc_init();
 
 	if (opt_mode == RUN_MODE_NONE) {
 		msg("%s: either -c or -x must be specified.\n", my_progname);
@@ -241,6 +242,9 @@ get_one_option(int optid, const struct my_option *opt __attribute__((unused)),
 		if (set_run_mode(RUN_MODE_EXTRACT)) {
 			return TRUE;
 		}
+		break;
+	case 'k':
+		hide_option(argument, &opt_encrypt_key);
 		break;
 	case '?':
 		usage();
@@ -473,6 +477,7 @@ extract_worker_thread_func(void *arg)
 					       chunk.path,
 					       chunk.pathlen);
 			if (entry == NULL) {
+				res = XB_STREAM_READ_ERROR;
 				pthread_mutex_unlock(ctxt->mutex);
 				break;
 			}
@@ -488,7 +493,9 @@ extract_worker_thread_func(void *arg)
 
 		pthread_mutex_unlock(ctxt->mutex);
 
-		res = xb_stream_validate_checksum(&chunk);
+		if (chunk.type == XB_CHUNK_TYPE_PAYLOAD) {
+			res = xb_stream_validate_checksum(&chunk);
+		}
 
 		if (res != XB_STREAM_READ_CHUNK) {
 			pthread_mutex_unlock(&entry->mutex);
@@ -525,8 +532,8 @@ extract_worker_thread_func(void *arg)
 		pthread_mutex_unlock(&entry->mutex);
 	}
 
-	if (chunk.data)
-		my_free(chunk.data);
+	if (chunk.raw_data)
+		my_free(chunk.raw_data);
 
 	my_thread_end();
 

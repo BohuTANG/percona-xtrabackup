@@ -58,13 +58,13 @@ Installing |Percona XtraBackup| from Percona ``yum`` repository
 
    .. code-block:: bash
 
-     yum install http://www.percona.com/downloads/percona-release/redhat/0.1-4/percona-release-0.1-4.noarch.rpm
+      $ yum install https://repo.percona.com/yum/percona-release-latest.noarch.rpm
 
    You should see some output such as the following:
 
    .. code-block:: bash
 
-     Retrieving http://www.percona.com/downloads/percona-release/redhat/0.1-4/percona-release-0.1-4.noarch.rpm
+     Retrieving https://repo.percona.com/yum/percona-release-latest.noarch.rpm
      Preparing...                ########################################### [100%]
         1:percona-release        ########################################### [100%]
 
@@ -76,9 +76,8 @@ Installing |Percona XtraBackup| from Percona ``yum`` repository
 
   .. code-block:: bash
 
-    $ wget http://www.percona.com/downloads/percona-release/redhat/0.1-4/\
-    percona-release-0.1-4.noarch.rpm
-    $ rpm -ivH percona-release-0.1-4.noarch.rpm
+    $ wget https://repo.percona.com/yum/percona-release-latest.noarch.rpm
+    $ rpm -ivH percona-release-latest.noarch.rpm
 
 2. Testing the repository
 
@@ -117,8 +116,8 @@ Installing |Percona XtraBackup| from Percona ``yum`` repository
 
 .. warning::
 
-   In order to sucessfully install |Percona XtraBackup| ``libev`` package will
-   need to be installed first. ``libev`` package can be installed from the
+   In order to sucessfully install |Percona XtraBackup| on CentOS prior to version 7, the ``libev`` package
+   needs to be installed first. This package ``libev`` package can be installed from the
    `EPEL <https://fedoraproject.org/wiki/EPEL>`_ repositories.
 
 .. _yum_testing:

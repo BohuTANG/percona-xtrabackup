@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1994, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1994, 2017, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -49,12 +49,38 @@ Created 5/11/1994 Heikki Tuuri
 #include "log.h"
 
 #ifdef _WIN32
+#include <mysql/innodb_priv.h> /* For sql_print_error */
+typedef VOID(WINAPI *time_fn)(LPFILETIME);
+static time_fn ut_get_system_time_as_file_time = GetSystemTimeAsFileTime;
+
 /*****************************************************************//**
 NOTE: The Windows epoch starts from 1601/01/01 whereas the Unix
 epoch starts from 1970/1/1. For selection of constant see:
 http://support.microsoft.com/kb/167296/ */
 #define WIN_TO_UNIX_DELTA_USEC	11644473600000000LL
 
+
+/**
+Initialise highest available time resolution API on Windows
+@return 0 if all OK else -1 */
+int
+ut_win_init_time()
+{
+	HMODULE h = LoadLibrary("kernel32.dll");
+	if (h != NULL)
+	{
+		time_fn pfn = (time_fn)GetProcAddress(h, "GetSystemTimePreciseAsFileTime");
+		if (pfn != NULL)
+		{
+			ut_get_system_time_as_file_time = pfn;
+		}
+		return false;
+	}
+	DWORD error = GetLastError();
+  sql_print_error(
+		"LoadLibrary(\"kernel32.dll\") failed: GetLastError returns %lu", error);
+	return(-1);
+}
 
 /*****************************************************************//**
 This is the Windows version of gettimeofday(2).
@@ -74,7 +100,7 @@ ut_gettimeofday(
 		return(-1);
 	}
 
-	GetSystemTimeAsFileTime(&ft);
+	ut_get_system_time_as_file_time(&ft);
 
 	tm = (int64_t) ft.dwHighDateTime << 32;
 	tm |= ft.dwLowDateTime;
@@ -734,6 +760,8 @@ ut_strerr(
 		return("Tablespace deleted or being deleted");
 	case DB_TABLESPACE_TRUNCATED:
 		return("Tablespace was truncated");
+	case DB_PAGE_IS_BLANK:
+		return("Page is blank");
 	case DB_TABLESPACE_NOT_FOUND:
 		return("Tablespace not found");
 	case DB_LOCK_TABLE_FULL:
@@ -819,13 +847,9 @@ ut_strerr(
 		       "transaction");
 	case DB_WRONG_FILE_NAME:
 		return("Invalid Filename");
-	case DB_NO_FK_ON_V_BASE_COL:
+	case DB_NO_FK_ON_S_BASE_COL:
 		return("Cannot add foreign key on the base column "
-		       "of indexed virtual column");
-	case DB_NO_VIRTUAL_INDEX_ON_FK:
-		return("Cannot create index on virtual column whose base "
-		       "column has foreign constraint");
-
+		       "of stored column");
 	case DB_COMPUTE_VALUE_FAILED:
 		return("Compute generated column failed");
 

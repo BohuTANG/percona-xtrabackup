@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2007, 2015, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2007, 2018, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -28,6 +28,7 @@ Created 2007/3/16 Sunny Bains.
 #include "fts0ast.h"
 #include "fts0pars.h"
 #include "fts0fts.h"
+#include "row0sel.h"
 
 /* The FTS ast visit pass. */
 enum fts_ast_visit_pass_t {
@@ -537,6 +538,36 @@ fts_ast_node_print(
 	fts_ast_node_print_recursive(node, 0);
 }
 
+/** Check only union operation involved in the node
+@param[in]	node	ast node to check
+@return true if the node contains only union else false. */
+bool
+fts_ast_node_check_union(
+	fts_ast_node_t*	node)
+{
+	if (node->type == FTS_AST_LIST
+	    || node->type == FTS_AST_SUBEXP_LIST
+	    || node->type == FTS_AST_PARSER_PHRASE_LIST) {
+
+		for (node = node->list.head; node; node = node->next) {
+			if (!fts_ast_node_check_union(node)) {
+				return(false);
+			}
+		}
+
+	} else if (node->type == FTS_AST_OPER
+		   && (node->oper == FTS_IGNORE
+		       || node->oper == FTS_EXIST)) {
+
+		return(false);
+	} else if (node->type == FTS_AST_TEXT) {
+		/* Distance or phrase search query. */
+		return(false);
+	}
+
+	return(true);
+}
+
 /******************************************************************//**
 Traverse the AST - in-order traversal, except for the FTX_EXIST and FTS_IGNORE
 nodes, which will be ignored in the first pass of each level, and visited in a
@@ -560,6 +591,7 @@ fts_ast_visit(
 	bool			revisit = false;
 	bool			will_be_ignored = false;
 	fts_ast_visit_pass_t	visit_pass = FTS_PASS_FIRST;
+	trx_t*	trx = node->trx;
 
 	start_node = node->list.head;
 
@@ -656,6 +688,10 @@ fts_ast_visit(
 				node->visited = true;
 			}
 		}
+	}
+
+	if (trx_is_interrupted(trx)) {
+		return (DB_INTERRUPTED);
 	}
 
 	if (revisit) {

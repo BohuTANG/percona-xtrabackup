@@ -1,4 +1,4 @@
-/* Copyright (c) 2015, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2015, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -33,15 +33,13 @@
 #include <replication.h>
 #include <rpl_channel_service_interface.h>
 #include <rpl_gtid.h>
+#include <rpl_write_set_handler.h>
 
 
 /**
-  Server side initializations and cleanup.
+  Server side initializations.
 */
-int group_replication_init(const char* plugin_name);
-int group_replication_cleanup();
-int group_replication_start();
-int group_replication_stop();
+int group_replication_init();
 
 
 /**
@@ -53,16 +51,19 @@ int group_replication_stop();
 */
 my_thread_attr_t *get_connection_attrib();
 
-
 /**
   Returns the server hostname, port and uuid.
 
   @param[out] hostname
   @param[out] port
   @param[out] uuid
-*/
-void get_server_host_port_uuid(char **hostname, uint *port, char** uuid);
+  @param[out] server_version
+  @param[out] server_ssl_variables
 
+*/
+void get_server_parameters(char **hostname, uint *port, char **uuid,
+                           unsigned int *server_version,
+                           st_server_ssl_variables* server_ssl_variables);
 
 /**
   Returns the server_id.
@@ -178,6 +179,21 @@ void global_thd_manager_add_thd(THD *thd);
 */
 void global_thd_manager_remove_thd(THD *thd);
 
+/**
+  Function that returns the write set extraction algorithm name.
+
+  @param[in] algorithm  The algorithm value
+
+  @return the algorithm name
+*/
+const char* get_write_set_algorithm_string(unsigned int algorithm);
+
+/**
+  Returns the value of slave_max_allowed_packet.
+
+  @return slave_max_allowed_packet
+*/
+unsigned long get_slave_max_allowed_packet();
 
 #endif	/* GROUP_REPLICATION_PRIV_INCLUDE */
 

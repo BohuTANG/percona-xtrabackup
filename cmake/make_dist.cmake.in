@@ -1,4 +1,4 @@
-# Copyright (c) 2009, 2015, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2017, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -28,6 +28,7 @@ SET(TAR_EXECUTABLE "@TAR_EXECUTABLE@")
 SET(CMAKE_GENERATOR "@CMAKE_GENERATOR@")
 SET(CMAKE_MAKE_PROGRAM "@CMAKE_MAKE_PROGRAM@")
 SET(CMAKE_SYSTEM_NAME "@CMAKE_SYSTEM_NAME@")
+SET(BUILD_IS_SINGLE_CONFIG "@BUILD_IS_SINGLE_CONFIG@")
 
 SET(VERSION "@VERSION@")
 
@@ -102,7 +103,7 @@ IF(NOT GIT_EXECUTABLE)
     CONFIGURE_FILE(${CMAKE_BINARY_DIR}/sql/sql_hints.yy.h
        ${CMAKE_BINARY_DIR}/sql_hints.yy.h COPYONLY)
 
-    IF(CMAKE_GENERATOR MATCHES "Makefiles")
+    IF(BUILD_IS_SINGLE_CONFIG)
     # make clean
     EXECUTE_PROCESS(
       COMMAND ${CMAKE_MAKE_PROGRAM} clean 
@@ -161,6 +162,18 @@ ENDIF()
 INCLUDE(${CMAKE_BINARY_DIR}/info_macros.cmake)
 IF(NOT EXISTS ${PACKAGE_DIR}/Docs/INFO_SRC)
   CREATE_INFO_SRC(${PACKAGE_DIR}/Docs)
+ENDIF()
+
+# Add xtrabackup man pages
+SET(MAN_BIN_DIR ${CMAKE_CURRENT_BINARY_DIR}/storage/innobase/xtrabackup/doc/source/build/man)
+SET(MAN_PKG_DIR ${PACKAGE_DIR}/storage/innobase/xtrabackup/doc/source/build/man)
+
+IF(EXISTS ${MAN_BIN_DIR})
+  FILE(GLOB MAN_FILES RELATIVE ${MAN_BIN_DIR} ${MAN_BIN_DIR}/*.1)
+  FOREACH(MAN_FILE ${MAN_FILES})
+    CONFIGURE_FILE(${MAN_BIN_DIR}/${MAN_FILE}
+      ${MAN_PKG_DIR}/${MAN_FILE} COPYONLY)
+  ENDFOREACH()
 ENDIF()
 
 # In case we used CPack, it could have copied some

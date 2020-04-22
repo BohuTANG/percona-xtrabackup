@@ -88,6 +88,7 @@ wf_incremental_init(xb_write_filt_ctxt_t *ctxt, char *dst_name,
 	info.page_size = cursor->page_size;
 	info.zip_size = cursor->zip_size;
 	info.space_id = cursor->space_id;
+	info.space_flags = cursor->space_flags;
 	if (!xb_write_delta_metadata(meta_name, &info)) {
 		msg("[%02u] xtrabackup: Error: "
 		    "failed to write meta info for %s\n",
@@ -121,7 +122,7 @@ wf_incremental_process(xb_write_filt_ctxt_t *ctxt, ds_file_t *dstfile)
 	for (i = 0, page = cursor->buf; i < cursor->buf_npages;
 	     i++, page += page_size) {
 
-		if (incremental_lsn >= mach_read_from_8(page + FIL_PAGE_LSN)) {
+		if (incremental_lsn > mach_read_from_8(page + FIL_PAGE_LSN)) {
 
 			continue;
 		}

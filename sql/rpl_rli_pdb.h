@@ -1,4 +1,4 @@
-/* Copyright (c) 2011, 2015, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2011, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -165,6 +165,7 @@ typedef struct st_slave_job_group
     checkpoint_relay_log_pos= 0;
     checkpoint_seqno= (uint) -1;
     done= 0;
+    ts= 0;
 #ifndef DBUG_OFF
     notified= false;
 #endif
@@ -206,19 +207,24 @@ public:
   {
   }
 
-   /**
-      Content of the being dequeued item is copied to the arg-pointer
-      location.
-
-      @return the queue's array index that the de-queued item
-      located at, or
-      an error encoded in beyond the index legacy range.
-   */
-  ulong de_queue(Element_type *val);
   /**
-     Similar to de_queue but extracting happens from the tail side.
+     Content of the being dequeued item is copied to the arg-pointer
+     location.
+
+     @param [out] item A pointer to the being dequeued item.
+     @return the queue's array index that the de-queued item
+     located at, or
+     an error encoded in beyond the index legacy range.
   */
-  ulong de_tail(Element_type *val);
+  ulong de_queue(Element_type *item);
+  /**
+    Similar to de_queue but extracting happens from the tail side.
+
+    @param [out] item A pointer to the being dequeued item.
+    @return the queue's array index that the de-queued item
+           located at, or an error.
+  */
+  ulong de_tail(Element_type *item);
 
   /**
     return the index where the arg item locates
@@ -229,7 +235,12 @@ public:
   /**
      return the value of @c data member of the head of the queue.
   */
-  Element_type* head_queue();
+  Element_type* head_queue()
+  {
+    if (empty())
+      return NULL;
+    return &m_Q[entry];
+  }
 
   bool   gt(ulong i, ulong k); // comparision of ordering of two entities
   /* index is within the valid range */
@@ -320,6 +331,30 @@ public:
       circular_buffer_queue<Slave_job_group>::en_queue(item);
   }
 
+  /**
+    Dequeue from head.
+
+    @param [out] item A pointer to the being dequeued item.
+    @return The queue's array index that the de-queued item located at,
+            or an error encoded in beyond the index legacy range.
+  */
+  ulong de_queue(Slave_job_group *item)
+  {
+    return circular_buffer_queue<Slave_job_group>::de_queue(item);
+  }
+
+  /**
+    Similar to de_queue() but removing an item from the tail side.
+
+    @param [out] item A pointer to the being dequeued item.
+    @return the queue's array index that the de-queued item
+           located at, or an error.
+  */
+  ulong de_tail(Slave_job_group *item)
+  {
+    return circular_buffer_queue<Slave_job_group>::de_tail(item);
+  }
+
   ulong find_lwm(Slave_job_group**, ulong);
 };
 
@@ -363,6 +398,71 @@ ulong circular_buffer_queue<Element_type>::en_queue(Element_type *item)
 }
 
 
+/**
+  Dequeue from head.
+
+  @param [out] item A pointer to the being dequeued item.
+  @return the queue's array index that the de-queued item
+          located at, or an error as an int outside the legacy
+          [0, size) (value `size' is excluded) range.
+*/
+template <typename Element_type>
+ulong circular_buffer_queue<Element_type>::de_queue(Element_type *item)
+{
+  ulong ret;
+  if (entry == size)
+  {
+    DBUG_ASSERT(len == 0);
+    return (ulong) -1;
+  }
+
+  ret= entry;
+  *item= m_Q[entry];
+  len--;
+
+  // pre boundary cond
+  if (avail == size)
+    avail= entry;
+  entry= (entry + 1) % size;
+
+  // post boundary cond
+  if (avail == entry)
+    entry= size;
+
+  DBUG_ASSERT(entry == size ||
+              (len == (avail >= entry)? (avail - entry) :
+               (size + avail - entry)));
+  DBUG_ASSERT(avail != entry);
+
+  return ret;
+}
+
+
+template <typename Element_type>
+ulong circular_buffer_queue<Element_type>::de_tail(Element_type *item)
+{
+  if (entry == size)
+  {
+    DBUG_ASSERT(len == 0);
+    return (ulong) -1;
+  }
+
+  avail= (entry + len - 1) % size;
+  *item= m_Q[avail];
+  len--;
+
+  // post boundary cond
+  if (avail == entry)
+    entry= size;
+
+  DBUG_ASSERT(entry == size ||
+              (len == (avail >= entry)? (avail - entry) :
+               (size + avail - entry)));
+  DBUG_ASSERT(avail != entry);
+
+  return avail;
+}
+
 
 class Slave_jobs_queue : public circular_buffer_queue<Slave_job_item>
 {
@@ -395,12 +495,6 @@ public:
 
   virtual ~Slave_worker();
 
-  /*
-    index value of some outstanding slots of info_slave_worker_fields
-  */
-  enum {
-    LINE_FOR_CHANNEL= 12
-  };
   Slave_jobs_queue jobs;   // assignment queue containing events to execute
   mysql_mutex_t jobs_lock; // mutex for the jobs queue
   mysql_cond_t  jobs_cond; // condition variable for the jobs queue
@@ -673,6 +767,16 @@ private:
   void assign_partition_db(Log_event *ev);
 
   void reset_order_commit_deadlock() { m_order_commit_deadlock= false; }
+public:
+  /**
+     Returns an array with the expected column numbers of the primary key
+     fields of the table repository.
+  */
+  static const uint *get_table_pk_field_indexes();
+  /**
+     Returns the index of the Channel_name field of the table repository.
+  */
+  static uint get_channel_field_index();
 };
 
 void * head_queue(Slave_jobs_queue *jobs, Slave_job_item *ret);

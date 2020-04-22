@@ -63,6 +63,9 @@ xb_mysql_query(MYSQL *connection, const char *query, bool use_result,
 my_ulonglong
 xb_mysql_numrows(MYSQL *connection, const char *query, bool die_on_error);
 
+char *
+read_mysql_one_value(MYSQL *connection, const char *query);
+
 void
 unlock_all(MYSQL *connection);
 
@@ -82,13 +85,13 @@ bool
 write_backup_config_file();
 
 bool
-lock_binlog_maybe(MYSQL *connection);
+lock_binlog_maybe(MYSQL *connection, int timeout, int retry_count);
 
 bool
-lock_tables_for_backup(MYSQL *connection, int timeout = 31536000);
+lock_tables_for_backup(MYSQL *connection, int timeout, int retry_count);
 
 bool
-lock_tables_maybe(MYSQL *connection);
+lock_tables_maybe(MYSQL *connection, int timeout, int retry_count);
 
 bool
 wait_for_safe_slave(MYSQL *connection);
@@ -110,5 +113,17 @@ mdl_lock_table(ulint space_id);
 
 void
 mdl_unlock_all();
+
+bool
+has_innodb_buffer_pool_dump();
+
+bool
+has_innodb_buffer_pool_dump_pct();
+
+void
+dump_innodb_buffer_pool(MYSQL *connection);
+
+void
+check_dump_innodb_buffer_pool(MYSQL *connection);
 
 #endif

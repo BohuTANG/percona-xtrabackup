@@ -52,10 +52,6 @@ Options
    no longer accessed. |Percona XtraBackup| can produce inconsistent backups
    with this option enabled. Use at your own risk.
 
-.. option::  --compact
-
-   Create a compact backup by skipping secondary index pages.
-
 .. option:: --compress
 
    This option tells |xtrabackup| to compress all output data, including the
@@ -87,11 +83,6 @@ Options
    unless :option:`xtrabackup --force-non-empty-directories` option is
    specified.
 
-.. option:: --create-ib-logfile
-
-   This option is not currently implemented. To create the InnoDB log files,
-   you must prepare the backup twice at present.
-
 .. option:: --databases=#
 
    This option specifies the list of databases and tables that should be backed
@@ -116,6 +107,15 @@ Options
    The source directory for the backup. This should be the same as the datadir
    for your |MySQL| server, so it should be read from :file:`my.cnf` if that
    exists; otherwise you must specify it on the command line.
+
+   When combined with the :option:`xtrabackup --copy-back` or
+   :option:`xtrabackup --move-back` option, :option:`xtrabackup --datadir`
+   refers to the destination directory.
+
+   Once connected to the server, in order to perform a backup you will need
+   ``READ`` and ``EXECUTE`` permissions at a filesystem level in the
+   server's :term:`datadir`.
+
 
 .. option:: --decompress
 
@@ -154,6 +154,65 @@ Options
    :option:`xtrabackup --defaults-group` option. It is needed for
    ``mysqld_multi`` deployments.
 
+.. option::  --dump-innodb-buffer-pool
+
+   This option controls whether or not a new dump of buffer pool
+   content should be done.
+
+   With ``--dump-innodb-buffer-pool``, |xtrabackup|
+   makes a request to the server to start the buffer pool dump (it
+   takes some time to complete and is done in background) at the
+   beginning of a backup provided the status variable
+   ``innodb_buffer_pool_dump_status`` reports that the dump has been
+   completed.
+
+   .. code-block:: bash
+
+      $ xtrabackup --backup --dump-innodb-buffer-pool --target-dir=/home/user/backup
+
+   By default, this option is set to `OFF`.
+
+   If ``innodb_buffer_pool_dump_status`` reports that there is running
+   dump of buffer pool, |xtrabackup| waits for the dump to complete
+   using the value of :option:`--dump-innodb-buffer-pool-timeout`
+
+   The file :file:`ib_buffer_pool` stores tablespace ID and page ID
+   data used to warm up the buffer pool sooner.
+
+   .. seealso::
+
+      |MySQL| Documentation: Saving and Restoring the Buffer Pool State
+         https://dev.mysql.com/doc/refman/5.7/en/innodb-preload-buffer-pool.html
+
+.. option:: --dump-innodb-buffer-pool-timeout
+
+   This option contains the number of seconds that |xtrabackup| should
+   monitor the value of ``innodb_buffer_pool_dump_status`` to
+   determine if buffer pool dump has completed.
+      
+   This option is used in combination with
+   :option:`--dump-innodb-buffer-pool`. By default, it is set to `10`
+   seconds.
+
+.. option:: --dump-innodb-buffer-pool-pct
+
+   This option contains the percentage of the most recently used buffer pool
+   pages to dump.
+
+   This option is effective if :option:`--dump-innodb-buffer-pool` option is set
+   to `ON`. If this option contains a value, |xtrabackup| sets the |MySQL|
+   system variable ``innodb_buffer_pool_dump_pct``. As soon as the buffer pool
+   dump completes or it is stopped (see
+   :option:`--dump-innodb-buffer-pool-timeout`), the value of the |MySQL| system
+   variable is restored.
+
+   .. seealso::
+
+      Changing the timeout for buffer pool dump
+         :option:`--dump-innodb-buffer-pool-timeout`
+      |MySQL| Documentation: innodb_buffer_pool_dump_pct system variable
+         https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_buffer_pool_dump_pct
+
 .. option:: --encrypt=ENCRYPTION_ALGORITHM
 
    This option instructs xtrabackup to encrypt backup copies of InnoDB data
@@ -180,7 +239,7 @@ Options
 .. option:: --encrypt-threads=#
 
    This option specifies the number of worker threads that will be used for
-   parallel encryption. It is passed directly to the xtrabackup child process.
+   parallel encryption/decryption.
    See the :program:`xtrabackup` :doc:`documentation
    <../xtrabackup_bin/xtrabackup_binary>` for more details.
 
@@ -247,6 +306,13 @@ Options
    performing the backup of |Percona XtraDB Cluster|. It has no effect when
    backup locks are used to create the backup.
 
+.. option:: --history=name
+
+   This option enables the tracking of the backup history in the
+   ``PERCONA_SCHEMA.xtrabackup_history`` table. An optional history series name
+   may be specified that will be placed with the history record for the backup
+   being taken.
+
 .. option:: --incremental-basedir=DIRECTORY
 
    When creating an incremental backup, this is the directory containing the
@@ -263,6 +329,30 @@ Options
    When creating an incremental backup, force a full scan of the data pages in
    the instance being backuped even if the complete changed page bitmap data is
    available.
+
+.. option:: --incremental-history-name=name
+
+   This option specifies the name of the backup series stored in the
+   :ref:`PERCONA_SCHEMA.xtrabackup_history <xtrabackup_history>` history record
+   to base an incremental backup on. |xtrabackup| searches the history
+   table for the most recent (highest innodb_to_lsn), successful backup
+   in the series and take the to_lsn value to use as the starting lsn for the
+   incremental backup. This will be mutually exclusive with :option:`xtrabackup
+   --incremental-history-uuid`, :option:`xtrabackup --incremental-basedir` and
+   :option:`xtrabackup --incremental-lsn`. If no valid :term:`LSN` can be found
+   (no series by that name, no successful backups by that name) |xtrabackup|
+   returns an error. It is used with the :option:`xtrabackup --incremental`
+   option.
+
+.. option:: --incremental-history-uuid=UUID
+
+   This option specifies the :term:`UUID` of the specific history record stored
+   in the :ref:`PERCONA_SCHEMA.xtrabackup_history <xtrabackup_history>` to base
+   an incremental backup on. :option:`xtrabackup --incremental-history-name`,
+   :option:`xtrabackup --incremental-basedir` and :option:`xtrabackup
+   --incremental-lsn`. If no valid :term:`LSN` is found (no success record with
+   that :term:`UUID`) |xtrabackup| returns an error. This option is used with
+   the :option:`xtrabackup --incremental` option.
 
 .. option:: --incremental-lsn=LSN
 
@@ -316,7 +406,8 @@ Options
 
 .. option:: --keyring-file-data=FILENAME
 
-   The path to the keyring file.
+   The path to the keyring file. Combine this option with
+   :option:`xtrabackup --xtrabackup-plugin-dir`.
 
 .. option:: --lock-ddl
 
@@ -349,11 +440,16 @@ Options
    Don't read default options from any option file. Must be given as the first
    option on the command-line.
 
+.. include:: ../.res/contents/option.no-version-check.txt
+
 .. option:: --parallel=#
 
    This option specifies the number of threads to use to copy multiple data
    files concurrently when creating a backup. The default value is 1 (i.e., no
-   concurrent transfer).
+   concurrent transfer). In |Percona XtraBackup| 2.3.10 and newer, this option
+   can be used with :option:`xtrabackup --copy-back` option to copy the user
+   data files in parallel (redo logs and system tablespaces are copied in the
+   main thread).
 
 .. option:: --password=PASSWORD
 
@@ -376,16 +472,6 @@ Options
    Makes :program:`xtrabackup` print out parameters that can be used for
    copying the data files back to their original locations to restore them. See
    :ref:`scripting-xtrabackup`.
-
-.. option:: --rebuild_indexes
-
-   Rebuild secondary indexes in InnoDB tables after applying the log. Only has
-   effect with --prepare.
-
-.. option::  --rebuild_threads=#
-
-   Use this number of threads to rebuild indexes in a compact backup. Only has
-   effect with --prepare and --rebuild-indexes.
 
 .. option:: --reencrypt-for-server-id=<new_server_id>
 
@@ -433,11 +519,11 @@ Options
 .. option:: --slave-info
 
    This option is useful when backing up a replication slave server. It prints
-   the binary log position of the master server. It also writes this
-   information to the :file:`xtrabackup_slave_info` file as a ``CHANGE MASTER``
-   command. A new slave for this master can be set up by starting a slave
-   server on this backup and issuing a ``CHANGE MASTER`` command with the
-   binary log position saved in the :file:`xtrabackup_slave_info` file.
+   the binary log position of the master server. It also writes the binary log
+   coordinates to the :file:`xtrabackup_slave_info` file as a ``CHANGE MASTER``
+   command. A new slave for this master can be set up by starting a slave server
+   on this backup and issuing a ``CHANGE MASTER`` command with the binary log
+   position saved in the :file:`xtrabackup_slave_info` file.
 
 .. option:: --ssl
 
@@ -549,11 +635,20 @@ Options
    If this option is a relative path, it is interpreted as being relative to
    the current working directory from which :program:`xtrabackup` is executed.
 
+   In order to perform a backup, you need ``READ``, ``WRITE``, and ``EXECUTE``
+   permissions at a filesystem level for the directory that you supply as the
+   value of :option:`--target-dir`.
+
 .. option:: --throttle=#
 
-   This option limits :option:`xtrabackup --backup` to the specified number of
-   read+write pairs of operations per second. See :doc:`throttling a backup
-   <throttling_backups>`.
+   This option limits the number of chunks copied per second. The chunk size is
+   *10 MB*. To limit the bandwidth to *10 MB/s*, set the option to *1*:
+   `--throttle=1`.
+
+   .. seealso::
+
+      More information about how to throttle a backup
+         :ref:`throttling_backups`
 
 .. option:: --tmpdir=name
 
@@ -565,6 +660,17 @@ Options
    This option is used to specify the LSN to which the logs should be applied
    when backups are being prepared. It can only be used with the
    :option:`xtrabackup --prepare` option.
+
+.. option:: --transition-key
+
+   This option is used to enable processing the backup without accessing the
+   keyring vault server. In this case, :program:`xtrabackup` derives the AES
+   encryption key from the specified passphrase and uses it to encrypt
+   tablespace keys of tablespaces being backed up.
+
+   If :option:`--transition-key <xtrabackup --transition-key>` does not have any
+   value, :program:`xtrabackup` will ask for it. The same passphrase should be
+   specified for the :option:`xtrabackup --prepare` command.
 
 .. option:: --use-memory=#
 
@@ -586,3 +692,16 @@ Options
 .. option:: --version
 
    This option prints |xtrabackup| version and exits.
+
+.. option:: --xtrabackup-plugin-dir=DIRNAME
+
+   The absolute path to the directory that contains the ``keyring`` plugin.
+
+   .. seealso::
+
+      |Percona Server| Documentation: keyring_vault plugin with Data at Rest Encryption
+         https://www.percona.com/doc/percona-server/LATEST/management/data_at_rest_encryption.html#keyring-vault-plugin
+      |MySQL| Documentation: Using the keyring_file File-Based Plugin
+         https://dev.mysql.com/doc/refman/5.7/en/keyring-file-plugin.html
+
+.. |program| replace:: :program:`xtrabackup`

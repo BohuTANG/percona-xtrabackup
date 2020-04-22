@@ -1,6 +1,6 @@
 /******************************************************
 XtraBackup: hot backup tool for InnoDB
-(c) 2009-2017 Percona LLC and/or its affiliates
+(c) 2009-2020 Percona LLC and/or its affiliates
 Originally Created 3/3/2009 Yasufumi Kinoshita
 Written by Alexey Kopytov, Aleksandr Kuzminsky, Stewart Smith, Vadim Tkachenko,
 Yasufumi Kinoshita, Ignacio Nin and Baron Schwartz.
@@ -69,6 +69,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <srv0start.h>
 #include <buf0dblwr.h>
 #include <my_aes.h>
+#include <sql_locale.h>
 
 #include <list>
 #include <sstream>
@@ -95,11 +96,12 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "backup_mysql.h"
 #include "backup_copy.h"
 #include "backup_mysql.h"
-#include "keyring.h"
+#include "keyring_plugins.h"
 #include "xb0xb.h"
 #include "ds_encrypt.h"
 #include "xbcrypt_common.h"
 #include "crc_glue.h"
+#include "xtrabackup_config.h"
 
 /* TODO: replace with appropriate macros used in InnoDB 5.6 */
 #define PAGE_ZIP_MIN_SIZE_SHIFT	10
@@ -148,6 +150,7 @@ char *xtrabackup_incremental = NULL;
 lsn_t incremental_lsn;
 lsn_t incremental_to_lsn;
 lsn_t incremental_last_lsn;
+lsn_t incremental_flushed_lsn;
 xb_page_bitmap *changed_page_bitmap = NULL;
 
 char *xtrabackup_incremental_basedir = NULL; /* for --backup */
@@ -303,7 +306,13 @@ my_bool innobase_adaptive_hash_index		= TRUE;
 
 static char *internal_innobase_data_file_path	= NULL;
 
-char*	xb_keyring_file_data			= NULL;
+char*	opt_transition_key			= NULL;
+char*	opt_xtra_plugin_dir			= NULL;
+
+my_bool	opt_generate_new_master_key = FALSE;
+my_bool	opt_generate_transition_key = FALSE;
+
+bool use_dumped_tablespace_keys = false;
 
 /* The following counter is used to convey information to InnoDB
 about server activity: in selects it is not sensible to call
@@ -359,6 +368,7 @@ bool innodb_checksum_algorithm_specified = false;
 /* String buffer used by --print-param to accumulate server options as they are
 parsed from the defaults file */
 static std::ostringstream print_param_str;
+static std::ostringstream param_str;
 
 /* Set of specified parameters */
 std::set<std::string> param_set;
@@ -373,7 +383,9 @@ my_bool opt_no_lock = FALSE;
 my_bool opt_safe_slave_backup = FALSE;
 my_bool opt_rsync = FALSE;
 my_bool opt_force_non_empty_dirs = FALSE;
+#ifdef HAVE_VERSION_CHECK
 my_bool opt_noversioncheck = FALSE;
+#endif
 my_bool opt_no_backup_locks = FALSE;
 my_bool opt_decompress = FALSE;
 my_bool opt_remove_original = FALSE;
@@ -398,6 +410,9 @@ uint opt_port = 0;
 char *opt_login_path = NULL;
 char *opt_log_bin = NULL;
 
+bool tty_password = false;
+bool tty_transition_key = false;
+
 const char *query_type_names[] = { "ALL", "UPDATE", "SELECT", NullS};
 
 TYPELIB query_type_typelib= {array_elements(query_type_names) - 1, "",
@@ -413,10 +428,15 @@ uint opt_lock_wait_timeout = 0;
 uint opt_lock_wait_threshold = 0;
 uint opt_debug_sleep_before_unlock = 0;
 uint opt_safe_slave_backup_timeout = 0;
+uint opt_dump_innodb_buffer_pool_timeout = 10;
+uint opt_dump_innodb_buffer_pool_pct = 0;
+my_bool opt_dump_innodb_buffer_pool = FALSE;
 
 my_bool opt_lock_ddl = FALSE;
 my_bool opt_lock_ddl_per_table = FALSE;
 uint opt_lock_ddl_timeout = 0;
+uint opt_backup_lock_timeout = 0;
+uint opt_backup_lock_retry_count = 0;
 
 const char *opt_history = NULL;
 my_bool opt_decrypt = FALSE;
@@ -516,7 +536,6 @@ datafiles_iter_next(datafiles_iter_t *it)
 		goto end;
 
 	it->node = UT_LIST_GET_FIRST(it->space->chain);
-
 end:
 	new_node = it->node;
 	mutex_exit(&it->mutex);
@@ -538,6 +557,7 @@ typedef struct {
 	uint			num;
 	uint			*count;
 	ib_mutex_t		*count_mutex;
+	bool			*error;
 	os_thread_id_t		id;
 } data_thread_ctxt_t;
 
@@ -645,10 +665,17 @@ enum options_xtrabackup
   OPT_LOCK_DDL,
   OPT_LOCK_DDL_TIMEOUT,
   OPT_LOCK_DDL_PER_TABLE,
+  OPT_BACKUP_LOCK_TIMEOUT,
+  OPT_BACKUP_LOCK_RETRY,
+  OPT_DUMP_INNODB_BUFFER,
+  OPT_DUMP_INNODB_BUFFER_TIMEOUT,
+  OPT_DUMP_INNODB_BUFFER_PCT,
   OPT_SAFE_SLAVE_BACKUP,
   OPT_RSYNC,
   OPT_FORCE_NON_EMPTY_DIRS,
+#ifdef HAVE_VERSION_CHECK
   OPT_NO_VERSION_CHECK,
+#endif
   OPT_NO_BACKUP_LOCKS,
   OPT_DECOMPRESS,
   OPT_INCREMENTAL_HISTORY_NAME,
@@ -665,8 +692,11 @@ enum options_xtrabackup
   OPT_SAFE_SLAVE_BACKUP_TIMEOUT,
   OPT_BINLOG_INFO,
   OPT_REDO_LOG_VERSION,
-  OPT_KEYRING_FILE_DATA,
   OPT_XB_SECURE_AUTH,
+  OPT_TRANSITION_KEY,
+  OPT_GENERATE_TRANSITION_KEY,
+  OPT_XTRA_PLUGIN_DIR,
+  OPT_GENERATE_NEW_MASTER_KEY,
 
   OPT_SSL_SSL,
   OPT_SSL_MODE,
@@ -790,8 +820,7 @@ struct my_option xb_client_options[] =
    &xtrabackup_encrypt_algo, &xtrabackup_encrypt_algo,
    &xtrabackup_encrypt_algo_typelib, GET_ENUM, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
 
-  {"encrypt-key", OPT_XTRA_ENCRYPT_KEY, "Encryption key to use.",
-   (G_PTR*) &xtrabackup_encrypt_key, (G_PTR*) &xtrabackup_encrypt_key, 0,
+  {"encrypt-key", OPT_XTRA_ENCRYPT_KEY, "Encryption key to use.",0, 0, 0,
    GET_STR_ALLOC, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
 
   {"encrypt-key-file", OPT_XTRA_ENCRYPT_KEY_FILE, "File which contains encryption key to use.",
@@ -904,6 +933,38 @@ struct my_option xb_client_options[] =
    (uchar*) &opt_lock_ddl_per_table, (uchar*) &opt_lock_ddl_per_table, 0,
    GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
 
+  {"backup-lock-timeout", OPT_BACKUP_LOCK_TIMEOUT,
+   "Timeout in seconds for attempts to acquire metadata locks.",
+   (uchar *)&opt_backup_lock_timeout, (uchar *)&opt_backup_lock_timeout, 0,
+   GET_UINT, REQUIRED_ARG, 31536000, 1, 31536000, 0, 1, 0},
+
+  {"backup-lock-retry-count", OPT_BACKUP_LOCK_RETRY,
+   "Number of attempts to acquire metadata locks.",
+   (uchar *)&opt_backup_lock_retry_count,
+   (uchar *)&opt_backup_lock_retry_count, 0,
+   GET_UINT, REQUIRED_ARG, 0, 0, UINT_MAX, 0, 1, 0},
+
+  {"dump-innodb-buffer-pool", OPT_DUMP_INNODB_BUFFER,
+   "Instruct MySQL server to dump innodb buffer pool by issuing a "
+   "SET GLOBAL innodb_buffer_pool_dump_now=ON ",
+   (uchar*) &opt_dump_innodb_buffer_pool,
+   (uchar*) &opt_dump_innodb_buffer_pool, 0,
+   GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
+
+  {"dump-innodb-buffer-pool-timeout", OPT_DUMP_INNODB_BUFFER_TIMEOUT,
+   "This option specifies the number of seconds xtrabackup waits "
+   "for innodb buffer pool dump to complete",
+   (uchar*) &opt_dump_innodb_buffer_pool_timeout,
+   (uchar*) &opt_dump_innodb_buffer_pool_timeout, 0, GET_UINT,
+   REQUIRED_ARG, 10, 0, 0, 0, 0, 0},
+
+  {"dump-innodb-buffer-pool-pct", OPT_DUMP_INNODB_BUFFER_PCT,
+   "This option specifies the percentage of buffer pool "
+   "to be dumped ",
+   (uchar*) &opt_dump_innodb_buffer_pool_pct,
+   (uchar*) &opt_dump_innodb_buffer_pool_pct, 0, GET_UINT,
+   REQUIRED_ARG, 0, 0, 100, 0, 1, 0},
+
   {"safe-slave-backup", OPT_SAFE_SLAVE_BACKUP, "Stop slave SQL thread "
    "and wait to start backup until Slave_open_temp_tables in "
    "\"SHOW STATUS\" is zero. If there are no open temporary tables, "
@@ -935,11 +996,13 @@ struct my_option xb_client_options[] =
    (uchar *) &opt_force_non_empty_dirs,
    0, GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
 
+#ifdef HAVE_VERSION_CHECK
   {"no-version-check", OPT_NO_VERSION_CHECK, "This option disables the "
    "version check which is enabled by the --version-check option.",
    (uchar *) &opt_noversioncheck,
    (uchar *) &opt_noversioncheck,
    0, GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
+#endif
 
   {"tables-compatibility-check", OPT_XTRA_TABLES_COMPATIBILITY_CHECK,
    "This option enables engine compatibility warning.",
@@ -984,8 +1047,7 @@ struct my_option xb_client_options[] =
   {"password", 'p', "This option specifies the password to use "
    "when connecting to the database. It accepts a string argument.  "
    "See mysql --help for details.",
-   0, 0, 0, GET_STR,
-   REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
+   0, 0, 0, GET_STR, OPT_ARG, 0, 0, 0, 0, 0, 0},
 
   {"socket", 'S', "This option specifies the socket to use when "
    "connecting to the local database server with a UNIX domain socket.  "
@@ -1251,8 +1313,11 @@ Disable with --skip-innodb-doublewrite.", (G_PTR*) &innobase_use_doublewrite,
    "Path to InnoDB log files.", &srv_log_group_home_dir,
    &srv_log_group_home_dir, 0, GET_STR_ALLOC, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
   {"innodb_max_dirty_pages_pct", OPT_INNODB_MAX_DIRTY_PAGES_PCT,
-   "Percentage of dirty pages allowed in bufferpool.", (G_PTR*) &srv_max_buf_pool_modified_pct,
-   (G_PTR*) &srv_max_buf_pool_modified_pct, 0, GET_ULONG, REQUIRED_ARG, 90, 0, 100, 0, 0, 0},
+   "Percentage of dirty pages allowed in bufferpool.",
+   (G_PTR*) &srv_max_buf_pool_modified_pct,
+   (G_PTR*) &srv_max_buf_pool_modified_pct, 0, GET_DOUBLE, REQUIRED_ARG,
+   (longlong)getopt_double2ulonglong(75), (longlong)getopt_double2ulonglong(0),
+   getopt_double2ulonglong(100), 0, 0, 0},
   {"innodb_open_files", OPT_INNODB_OPEN_FILES,
    "How many files at the maximum InnoDB keeps open at the same time.",
    (G_PTR*) &innobase_open_files, (G_PTR*) &innobase_open_files, 0,
@@ -1329,14 +1394,27 @@ Disable with --skip-innodb-doublewrite.", (G_PTR*) &innobase_use_doublewrite,
    &redo_log_version, &redo_log_version, 0, GET_UINT,
    REQUIRED_ARG, 1, 0, 0, 0, 0, 0},
 
-  {"keyring-file-data", OPT_KEYRING_FILE_DATA,
-   "The path to the keyring file.", &xb_keyring_file_data,
-   &xb_keyring_file_data, 0, GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0,
-   0},
-
   {"server-id", OPT_XTRA_SERVER_ID, "The server instance being backed up",
    &server_id, &server_id, 0, GET_UINT, REQUIRED_ARG, 0, 0, UINT_MAX32,
    0, 0, 0},
+
+  {"transition-key", OPT_TRANSITION_KEY, "Transition key to encrypt "
+   "tablespace keys with.", 0, 0, 0, GET_STR, OPT_ARG, 0, 0, 0, 0, 0, 0},
+
+  {"xtrabackup-plugin-dir", OPT_XTRA_PLUGIN_DIR,
+   "Directory for xtrabackup plugins.",
+   &opt_xtra_plugin_dir, &opt_xtra_plugin_dir,
+   0, GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
+
+  {"generate-new-master-key", OPT_GENERATE_NEW_MASTER_KEY,
+   "Generate new master key when doing copy-back.",
+   &opt_generate_new_master_key, &opt_generate_new_master_key, 0, GET_BOOL,
+   NO_ARG, 0, 0, 0, 0, 0, 0},
+
+  {"generate-transition-key", OPT_GENERATE_TRANSITION_KEY,
+   "Generate transition key and store it into keyring.",
+   &opt_generate_transition_key, &opt_generate_transition_key, 0, GET_BOOL,
+   NO_ARG, 0, 0, 0, 0, 0, 0},
 
   { 0, 0, 0, 0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0}
 };
@@ -1455,9 +1533,27 @@ check_if_param_set(const char *param)
 
 my_bool
 xb_get_one_option(int optid,
-		  const struct my_option *opt __attribute__((unused)),
+		  const struct my_option *opt,
 		  char *argument)
 {
+  static const char* hide_value[]=
+    { "password", "encrypt-key", "transition-key" };
+
+  param_str << "--" << opt->name;
+  if (argument) {
+    bool param_handled = false;
+    for (unsigned i=0; i<sizeof(hide_value)/sizeof(char*); ++i) {
+      if (strcmp(opt->name, hide_value[i]) == 0) {
+        param_handled = true;
+        param_str << "=*";
+        break;
+      }
+    }
+    if(!param_handled) {
+      param_str << "=" << argument;
+    }
+  }
+  param_str << " ";
   switch(optid) {
   case 'h':
     strmake(mysql_real_data_home,argument, FN_REFLEN - 1);
@@ -1614,17 +1710,34 @@ xb_get_one_option(int optid,
     opt_encrypt_for_server_id_specified = true;
     break;
   case 'p':
+    if (argument == disabled_my_option)
+      argument= (char*) "";                       /* Don't require password */
     if (argument)
     {
-      char *start= argument;
-      my_free(opt_password);
-      opt_password= my_strdup(PSI_NOT_INSTRUMENTED, argument, MYF(MY_FAE));
-      while (*argument) *argument++= 'x';               // Destroy argument
-      if (*start)
-        start[1]=0 ;
+      hide_option(argument, &opt_password);
+      tty_password = false;
     }
+    else
+      tty_password = true;
     break;
-
+  case OPT_TRANSITION_KEY:
+    if (argument == disabled_my_option)
+      argument = (char*) "";                      /* Don't require password */
+    if (argument)
+    {
+      hide_option(argument, &opt_transition_key);
+      tty_transition_key = false;
+    }
+    else
+      tty_transition_key = true;
+    use_dumped_tablespace_keys = true;
+    break;
+  case OPT_GENERATE_TRANSITION_KEY:
+    use_dumped_tablespace_keys = true;
+    break;
+  case OPT_XTRA_ENCRYPT_KEY:
+    hide_option(argument, &xtrabackup_encrypt_key);
+    break;
 
 #include "sslopt-case.h"
 
@@ -1650,7 +1763,7 @@ xb_init_log_block_size(void)
 {
 	srv_log_block_size = 0;
 	if (innobase_log_block_size != 512) {
-		uint	n_shift = get_bit_shift(innobase_log_block_size);;
+		uint	n_shift = get_bit_shift(innobase_log_block_size);
 
 		if (n_shift > 0) {
 			srv_log_block_size = (1 << n_shift);
@@ -2092,19 +2205,17 @@ xtrabackup_read_metadata(char *filename)
 		r = FALSE;
 		goto end;
 	}
-	/* Use UINT64PF instead of LSN_PF here, as we have to maintain the file
-	format. */
-	if (fscanf(fp, "from_lsn = " UINT64PF "\n", &metadata_from_lsn)
+	if (fscanf(fp, "from_lsn = " LSN_PF "\n", &metadata_from_lsn)
 			!= 1) {
 		r = FALSE;
 		goto end;
 	}
-	if (fscanf(fp, "to_lsn = " UINT64PF "\n", &metadata_to_lsn)
+	if (fscanf(fp, "to_lsn = " LSN_PF "\n", &metadata_to_lsn)
 			!= 1) {
 		r = FALSE;
 		goto end;
 	}
-	if (fscanf(fp, "last_lsn = " UINT64PF "\n", &metadata_last_lsn)
+	if (fscanf(fp, "last_lsn = " LSN_PF "\n", &metadata_last_lsn)
 			!= 1) {
 		metadata_last_lsn = 0;
 	}
@@ -2119,6 +2230,11 @@ xtrabackup_read_metadata(char *filename)
 	if (fscanf(fp, "recover_binlog_info = %d\n", &t) == 1) {
 		recover_binlog_info = (t == 1);
 	}
+
+	if (fscanf(fp, "flushed_lsn = " LSN_PF "\n",
+		   &backup_redo_log_flushed_lsn) != 1) {
+		backup_redo_log_flushed_lsn = 0;
+	}
 end:
 	fclose(fp);
 
@@ -2131,21 +2247,23 @@ static
 void
 xtrabackup_print_metadata(char *buf, size_t buf_len)
 {
-	/* Use UINT64PF instead of LSN_PF here, as we have to maintain the file
-	format. */
 	snprintf(buf, buf_len,
 		 "backup_type = %s\n"
-		 "from_lsn = " UINT64PF "\n"
-		 "to_lsn = " UINT64PF "\n"
-		 "last_lsn = " UINT64PF "\n"
+		 "from_lsn = " LSN_PF "\n"
+		 "to_lsn = " LSN_PF "\n"
+		 "last_lsn = " LSN_PF "\n"
 		 "compact = %d\n"
-		 "recover_binlog_info = %d\n",
+		 "recover_binlog_info = %d\n"
+		 "flushed_lsn = " LSN_PF "\n",
 		 metadata_type,
 		 metadata_from_lsn,
 		 metadata_to_lsn,
 		 metadata_last_lsn,
 		 MY_TEST(xtrabackup_compact == TRUE),
-		 MY_TEST(opt_binlog_info == BINLOG_INFO_LOCKLESS));
+		 MY_TEST((xtrabackup_backup &&
+			  (opt_binlog_info == BINLOG_INFO_LOCKLESS)) ||
+			 (xtrabackup_prepare && recover_binlog_info)),
+		 backup_redo_log_flushed_lsn);
 }
 
 /***********************************************************************
@@ -2234,6 +2352,7 @@ xb_read_delta_metadata(const char *filepath, xb_delta_info_t *info)
 	info->page_size = ULINT_UNDEFINED;
 	info->zip_size = ULINT_UNDEFINED;
 	info->space_id = ULINT_UNDEFINED;
+	info->space_flags = 0;
 
 	fp = fopen(filepath, "r");
 	if (!fp) {
@@ -2249,6 +2368,8 @@ xb_read_delta_metadata(const char *filepath, xb_delta_info_t *info)
 				info->zip_size = strtoul(value, NULL, 10);
 			} else if (strcmp(key, "space_id") == 0) {
 				info->space_id = strtoul(value, NULL, 10);
+			} else if (strcmp(key, "space_flags") == 0) {
+				info->space_flags = strtoul(value, NULL, 10);
 			}
 		}
 	}
@@ -2275,7 +2396,7 @@ my_bool
 xb_write_delta_metadata(const char *filename, const xb_delta_info_t *info)
 {
 	ds_file_t	*f;
-	char		buf[64];
+	char		buf[200];
 	my_bool		ret;
 	size_t		len;
 	MY_STAT		mystat;
@@ -2283,8 +2404,10 @@ xb_write_delta_metadata(const char *filename, const xb_delta_info_t *info)
 	snprintf(buf, sizeof(buf),
 		 "page_size = %lu\n"
 		 "zip_size = %lu\n"
-		 "space_id = %lu\n",
-		 info->page_size, info->zip_size, info->space_id);
+		 "space_id = %lu\n"
+		 "space_flags = %lu\n",
+		 info->page_size, info->zip_size, info->space_id,
+		 info->space_flags);
 	len = strlen(buf);
 
 	mystat.st_size = len;
@@ -2324,7 +2447,7 @@ xtrabackup_write_info(const char *filepath)
 void
 xtrabackup_io_throttling(void)
 {
-	if (xtrabackup_throttle && (io_ticket--) < 0) {
+	if (xtrabackup_throttle && (--io_ticket) < 0) {
 		os_event_reset(wait_throttle);
 		os_event_wait(wait_throttle);
 	}
@@ -2567,7 +2690,7 @@ check_if_skip_table(
 Reads the space flags from a given data file and returns the
 page size. */
 const page_size_t
-xb_get_zip_size(os_file_t file, bool *success)
+xb_get_zip_size(pfs_os_file_t file, bool *success)
 {
 	byte		*buf;
 	byte		*page;
@@ -2760,7 +2883,7 @@ error:
 		ds_close(dstfile);
 	}
 	if (write_filter && write_filter->deinit) {
-		write_filter->deinit(&write_filt_ctxt);;
+		write_filter->deinit(&write_filt_ctxt);
 	}
 	msg("[%02u] xtrabackup: Error: "
 	    "xtrabackup_copy_datafile() failed.\n", thread_n);
@@ -3034,7 +3157,7 @@ xtrabackup_scan_log_recs(
 		/* Try to parse more log records */
 
 		if (recv_parse_log_recs(checkpoint_lsn,	/*!< in: latest checkpoint LSN */
-					STORE_NO, false)) {
+					STORE_NO)) {
 			ut_ad(recv_sys->found_corrupt_log
 			      || recv_sys->found_corrupt_fs
 			      || recv_sys->mlog_checkpoint_lsn
@@ -3264,13 +3387,14 @@ data_copy_thread_func(
 
 	debug_sync_point("data_copy_thread_func");
 
-	while ((node = datafiles_iter_next(ctxt->it)) != NULL) {
+	while ((node = datafiles_iter_next(ctxt->it)) != NULL &&
+		!*(ctxt->error)) {
 
 		/* copy the datafile */
 		if(xtrabackup_copy_datafile(node, num)) {
 			msg("[%02u] xtrabackup: Error: "
 			    "failed to copy datafile.\n", num);
-			exit(EXIT_FAILURE);
+			*(ctxt->error) = true;
 		}
 	}
 
@@ -3364,10 +3488,10 @@ xtrabackup_init_datasinks(void)
 			ds = ds_create(xtrabackup_target_dir, DS_TYPE_ENCRYPT);
 			xtrabackup_add_datasink(ds);
 
-			ds_set_pipe(ds, ds_meta);
-			ds_redo = ds_meta = ds;
+			ds_set_pipe(ds, ds_redo);
+			ds_redo = ds;
 		} else {
-			ds_redo = ds_data = ds_meta = ds;
+			ds_redo = ds_data = ds;
 		}
 	}
 
@@ -3377,13 +3501,13 @@ xtrabackup_init_datasinks(void)
 
 		/* Use a 1 MB buffer for compressed output stream */
 		ds = ds_create(xtrabackup_target_dir, DS_TYPE_BUFFER);
-		ds_buffer_set_size(ds, 1024 * 1024);
+		ds_buffer_set_size(ds, opt_read_buffer_size);
 		xtrabackup_add_datasink(ds);
 		ds_set_pipe(ds, ds_data);
 		if (ds_data != ds_redo) {
 			ds_data = ds;
 			ds = ds_create(xtrabackup_target_dir, DS_TYPE_BUFFER);
-			ds_buffer_set_size(ds, 1024 * 1024);
+			ds_buffer_set_size(ds, opt_read_buffer_size);
 			xtrabackup_add_datasink(ds);
 			ds_set_pipe(ds, ds_redo);
 			ds_redo = ds;
@@ -3531,18 +3655,30 @@ xb_load_single_table_tablespace(
 
 		ut_a(space != NULL);
 
-		/* For encryption tablespace, initialize encryption
+		/* For encrypted tablespace, initialize encryption
 		information.*/
 		if (FSP_FLAGS_GET_ENCRYPTION(file->flags())) {
-			byte*	key = file->m_encryption_key;
-			byte*	iv = file->m_encryption_iv;
-			ut_ad(key && iv);
+			if (srv_backup_mode || !use_dumped_tablespace_keys) {
+				byte*	key = file->m_encryption_key;
+				byte*	iv = file->m_encryption_iv;
 
-			err = fil_set_encryption(space->id, Encryption::AES,
-						 key, iv);
+				if (key && iv) {
+					err = fil_set_encryption(
+						space->id,
+						Encryption::AES, key, iv);
+				}
+			} else {
+				byte key[ENCRYPTION_KEY_LEN];
+				byte iv[ENCRYPTION_KEY_LEN];
+
+				xb_fetch_tablespace_key(space->id, key, iv);
+
+				err = fil_set_encryption(space->id,
+					Encryption::AES, key, iv);
+			}
+
 			ut_ad(err == DB_SUCCESS);
 		}
-
 
 		if (!fil_node_create(file->filepath(), n_pages, space,
 				     false, false)) {
@@ -3557,9 +3693,12 @@ xb_load_single_table_tablespace(
 			fil_space_close(space->name);
 		}
 	} else {
-		/* allow corrupted first page for xtrabackup, it coulde be just
-		zero-filled page, which we restoer from redo log later */
-		if (xtrabackup_backup && err != DB_CORRUPTION) {
+		/* allow corrupted first page for xtrabackup, it could be just
+		zero-filled page, which we'll restore from redo log later */
+		if (xtrabackup_backup && err != DB_PAGE_IS_BLANK) {
+			exit(EXIT_FAILURE);
+		}
+		if (xtrabackup_prepare) {
 			exit(EXIT_FAILURE);
 		}
 	}
@@ -4571,9 +4710,12 @@ xtrabackup_backup_func(void)
 	ut_crc32_init();
 	crc_init();
 
-	xb_keyring_init(xb_keyring_file_data);
-
 	xb_filters_init();
+
+	if (!xb_keyring_init_for_backup(mysql_connection)) {
+		msg("xtrabackup: Error: failed to init keyring plugin\n");
+		exit(EXIT_FAILURE);
+	}
 
 	if (opt_tables_compatibility_check) {
 		xb_tables_compatibility_check();
@@ -4649,6 +4791,11 @@ xtrabackup_backup_func(void)
 		exit(EXIT_FAILURE);
 	}
 
+
+	if (opt_dump_innodb_buffer_pool) {
+		dump_innodb_buffer_pool(mysql_connection);
+	}
+
         {
         fil_system_t*   f_system = fil_system;
 
@@ -4659,6 +4806,7 @@ xtrabackup_backup_func(void)
 	byte*		log_hdr_buf_;
 	byte*		log_hdr_buf;
 	ulint		err;
+	bool		data_copying_error = false;
 
 	/* start back ground thread to copy newer log */
 	os_thread_id_t log_copying_thread_id;
@@ -4792,7 +4940,8 @@ reread_log_header:
 	debug_sync_point("xtrabackup_suspend_at_start");
 
 	if (xtrabackup_incremental) {
-		if (!xtrabackup_incremental_force_scan) {
+		if (!xtrabackup_incremental_force_scan &&
+		    have_changed_page_bitmaps) {
 			changed_page_bitmap = xb_page_bitmap_init();
 		}
 		if (!changed_page_bitmap) {
@@ -4834,6 +4983,7 @@ reread_log_header:
 		data_threads[i].num = i+1;
 		data_threads[i].count = &count;
 		data_threads[i].count_mutex = &count_mutex;
+		data_threads[i].error = &data_copying_error;
 		os_thread_create(data_copy_thread_func, data_threads + i,
 				 &data_threads[i].id);
 	}
@@ -4852,6 +5002,10 @@ reread_log_header:
 	mutex_free(&count_mutex);
 	ut_free(data_threads);
 	datafiles_iter_free(it);
+
+	if (data_copying_error) {
+		exit(EXIT_FAILURE);
+	}
 
 	if (changed_page_bitmap) {
 		xb_page_bitmap_deinit(changed_page_bitmap);
@@ -4951,6 +5105,16 @@ skip_last_cp:
 		mdl_unlock_all();
 	}
 
+	if (opt_transition_key != NULL || opt_generate_transition_key) {
+		if (!xb_tablespace_keys_dump(ds_data, opt_transition_key,
+                    opt_transition_key != NULL ?
+                    	strlen(opt_transition_key) : 0)) {
+			msg("xtrabackup: Error: failed to dump "
+			    "tablespace keys.\n");
+			exit(EXIT_FAILURE);
+		}
+	}
+
 	xtrabackup_destroy_datasinks();
 
 	if (wait_throttle) {
@@ -4981,6 +5145,8 @@ skip_last_cp:
 	row_mysql_close();
 
 	sync_check_close();
+
+	xb_keyring_shutdown();
 
 	/* Make sure that the latest checkpoint made it to xtrabackup_logfile */
 	if (latest_cp > log_copy_scanned_lsn) {
@@ -5199,7 +5365,7 @@ loop:
 }
 
 static void
-xtrabackup_stats_func(void)
+xtrabackup_stats_func(int argc, char **argv)
 {
 	ulint n;
 
@@ -5219,9 +5385,15 @@ xtrabackup_stats_func(void)
 	/* set read only */
 	srv_read_only_mode = TRUE;
 
-	/* initialize components */
-	if(innodb_init_param())
+	if (!xb_keyring_init_for_stats(argc, argv)) {
+		msg("xtrabackup: error: failed to init keyring plugin.\n");
 		exit(EXIT_FAILURE);
+	}
+
+	/* initialize components */
+	if(innodb_init_param()) {
+		exit(EXIT_FAILURE);
+	}
 
 	/* Check if the log files have been created, otherwise innodb_init()
 	will crash when called with srv_read_only == TRUE */
@@ -5414,6 +5586,8 @@ end:
 	/* shutdown InnoDB */
 	if(innodb_end())
 		exit(EXIT_FAILURE);
+
+	xb_keyring_shutdown();
 }
 
 /* ================= prepare ================= */
@@ -5525,7 +5699,7 @@ update_log_temp_checkpoint(
 static my_bool
 xtrabackup_init_temp_log(void)
 {
-	os_file_t	src_file = XB_FILE_UNDEFINED;
+	pfs_os_file_t	src_file = XB_FILE_UNDEFINED;
 	char		src_path[FN_REFLEN];
 	char		dst_path[FN_REFLEN];
 	bool		success;
@@ -5638,8 +5812,13 @@ retry:
 		goto error;
 	}
 
-	if ( ut_memcmp(log_buf + LOG_HEADER_CREATOR,
-			(byte*)"xtrabkup", (sizeof "xtrabkup") - 1) != 0 ) {
+	if (ut_memcmp(log_buf + LOG_HEADER_CREATOR, (byte *)"xtrabkup",
+		      (sizeof "xtrabkup") - 1) != 0) {
+		if (xtrabackup_incremental_dir) {
+			msg("xtrabackup: error: xtrabackup_logfile was already used "
+			    "to '--prepare'.\n");
+			goto error;
+		}
 		msg("xtrabackup: notice: xtrabackup_logfile was already used "
 		    "to '--prepare'.\n");
 		goto skip_modify;
@@ -5856,7 +6035,7 @@ xb_space_create_file(
 	ulint		space_id,	/*!<in: space id */
 	ulint		flags __attribute__((unused)),/*!<in: tablespace
 					flags */
-	os_file_t*	file)		/*!<out: file handle */
+	pfs_os_file_t*	file)		/*!<out: file handle */
 {
 	const ulint	size = FIL_IBD_FILE_INITIAL_SIZE;
 	dberr_t		err;
@@ -5917,7 +6096,7 @@ xb_space_create_file(
 	if (fil_fusionio_enable_atomic_write(*file)) {
 
 		/* This is required by FusionIO HW/Firmware */
-		int	ret = posix_fallocate(*file, 0, size * UNIV_PAGE_SIZE);
+		int	ret = posix_fallocate(file->m_file, 0, size * UNIV_PAGE_SIZE);
 
 		if (ret != 0) {
 
@@ -6035,11 +6214,12 @@ mismatching ID, renames it to xtrabackup_tmp_#ID.ibd. If there was no
 matching file, creates a new tablespace.
 @return file handle of matched or created file */
 static
-os_file_t
+pfs_os_file_t
 xb_delta_open_matching_space(
 	const char*	dbname,		/* in: path to destination database dir */
 	const char*	name,		/* in: name of delta file (without .delta) */
 	ulint		space_id,	/* in: space id of delta file */
+	ulint		space_flags,	/* in: space flags of delta file */
 	ulint		zip_size,	/* in: zip_size of tablespace */
 	char*		real_name,	/* out: full path of destination file */
 	size_t		real_name_len,	/* out: buffer size for real_name */
@@ -6049,8 +6229,7 @@ xb_delta_open_matching_space(
 	char			dest_space_name[FN_REFLEN];
 	bool			ok;
 	fil_space_t*		fil_space;
-	os_file_t		file	= 0;
-	ulint			tablespace_flags;
+	pfs_os_file_t		file	= XB_FILE_UNDEFINED;
 	xb_filter_entry_t*	table;
 
 	*success = false;
@@ -6144,8 +6323,8 @@ xb_delta_open_matching_space(
 
 	if (space_id == ULINT_UNDEFINED)
 	{
-		msg("xtrabackup: Error: Cannot handle DDL operation on tablespace "
-		    "%s\n", dest_space_name);
+		msg("xtrabackup: Error: Cannot handle DDL operation on "
+		    "tablespace %s\n", dest_space_name);
 		exit(EXIT_FAILURE);
 	}
 	mutex_enter(&fil_system->mutex);
@@ -6181,7 +6360,7 @@ xb_delta_open_matching_space(
 
 	/* No matching space found. create the new one.  */
 
-	if (!fil_space_create(dest_space_name, space_id, 0,
+	if (!fil_space_create(dest_space_name, space_id, space_flags,
 			      FIL_TYPE_TABLESPACE)) {
 		msg("xtrabackup: Cannot create tablespace %s\n",
 			dest_space_name);
@@ -6189,19 +6368,16 @@ xb_delta_open_matching_space(
 	}
 
 	/* Calculate correct tablespace flags for compressed tablespaces.  */
-	if (!zip_size || zip_size == ULINT_UNDEFINED) {
-		tablespace_flags = 0;
-	}
-	else {
-		tablespace_flags
-			= (get_bit_shift(zip_size >> PAGE_ZIP_MIN_SIZE_SHIFT
+	if (zip_size != 0 && zip_size != ULINT_UNDEFINED) {
+		space_flags
+			|= (get_bit_shift(zip_size >> PAGE_ZIP_MIN_SIZE_SHIFT
 					 << 1)
 			   << DICT_TF_ZSSIZE_SHIFT)
 			| DICT_TF_COMPACT
 			| (DICT_TF_FORMAT_ZIP << DICT_TF_FORMAT_SHIFT);
-		ut_a(page_size_t(tablespace_flags).physical() == zip_size);
+		ut_a(page_size_t(space_flags).physical() == zip_size);
 	}
-	*success = xb_space_create_file(real_name, space_id, tablespace_flags,
+	*success = xb_space_create_file(real_name, space_id, space_flags,
 					&file);
 	goto exit;
 
@@ -6237,10 +6413,10 @@ xtrabackup_apply_delta(
 					including the .delta extension */
 	void*		/*data*/)
 {
-	os_file_t	src_file = XB_FILE_UNDEFINED;
-	os_file_t	dst_file = XB_FILE_UNDEFINED;
-	char	src_path[FN_REFLEN];
-	char	dst_path[FN_REFLEN];
+	pfs_os_file_t	src_file = XB_FILE_UNDEFINED;
+	pfs_os_file_t	dst_file = XB_FILE_UNDEFINED;
+	char	src_path[FN_REFLEN * 2 + 2];
+	char	dst_path[FN_REFLEN * 2 + 2];
 	char	meta_path[FN_REFLEN];
 	char	space_name[FN_REFLEN];
 	bool	success;
@@ -6292,8 +6468,8 @@ xtrabackup_apply_delta(
 
 	page_size = info.page_size;
 	page_size_shift = get_bit_shift(page_size);
-	msg("xtrabackup: page size for %s is %lu bytes\n",
-	    src_path, page_size);
+	msg("xtrabackup: page size for %s is %lu bytes space id is %lu\n",
+	    src_path, page_size, info.space_id);
 	if (page_size_shift < 10 ||
 	    page_size_shift > UNIV_PAGE_SIZE_SHIFT_MAX) {
 		msg("xtrabackup: error: invalid value of page_size "
@@ -6312,21 +6488,22 @@ xtrabackup_apply_delta(
 		goto error;
 	}
 
-	posix_fadvise(src_file, 0, 0, POSIX_FADV_SEQUENTIAL);
+	posix_fadvise(src_file.m_file, 0, 0, POSIX_FADV_SEQUENTIAL);
 
-	os_file_set_nocache(src_file, src_path, "OPEN");
+	os_file_set_nocache(src_file.m_file, src_path, "OPEN");
 
-	dst_file = xb_delta_open_matching_space(
-			dbname, space_name, info.space_id, info.zip_size,
-			dst_path, sizeof(dst_path), &success);
+	dst_file = xb_delta_open_matching_space(dbname, space_name,
+						info.space_id, info.space_flags,
+						info.zip_size, dst_path,
+						sizeof(dst_path), &success);
 	if (!success) {
 		msg("xtrabackup: error: cannot open %s\n", dst_path);
 		goto error;
 	}
 
-	posix_fadvise(dst_file, 0, 0, POSIX_FADV_DONTNEED);
+	posix_fadvise(dst_file.m_file, 0, 0, POSIX_FADV_DONTNEED);
 
-	os_file_set_nocache(dst_file, dst_path, "OPEN");
+	os_file_set_nocache(dst_file.m_file, dst_path, "OPEN");
 
 	/* allocate buffer for incremental backup */
 	incremental_buffer_base = static_cast<byte *>
@@ -6365,7 +6542,8 @@ xtrabackup_apply_delta(
 
 		for (page_in_buffer = 1; page_in_buffer < page_size / 4;
 		     page_in_buffer++) {
-			if (mach_read_from_4(incremental_buffer + page_in_buffer * 4)
+			if (mach_read_from_4(incremental_buffer +
+					     page_in_buffer * 4)
 			    == 0xFFFFFFFFUL)
 				break;
 		}
@@ -6380,14 +6558,16 @@ xtrabackup_apply_delta(
 			goto error;
 		}
 
-		posix_fadvise(src_file, offset, page_in_buffer * page_size,
+		posix_fadvise(src_file.m_file, offset,
+			      page_in_buffer * page_size,
 			      POSIX_FADV_DONTNEED);
 
 		for (page_in_buffer = 1; page_in_buffer < page_size / 4;
 		     page_in_buffer++) {
 			ulint offset_on_page;
 
-			offset_on_page = mach_read_from_4(incremental_buffer + page_in_buffer * 4);
+			offset_on_page = mach_read_from_4(incremental_buffer +
+							  page_in_buffer * 4);
 
 			if (offset_on_page == 0xFFFFFFFFUL)
 				break;
@@ -6625,7 +6805,7 @@ xtrabackup_apply_deltas()
 static my_bool
 xtrabackup_close_temp_log(my_bool clear_flag)
 {
-	os_file_t	src_file = XB_FILE_UNDEFINED;
+	pfs_os_file_t	src_file = XB_FILE_UNDEFINED;
 	char		src_path[FN_REFLEN];
 	char		dst_path[FN_REFLEN];
 	bool		success;
@@ -7244,8 +7424,6 @@ reencrypt_tablespace_keys(
 	bool			ret = false;
 	Encryption::Version	version;
 
-	xb_keyring_init(xb_keyring_file_data);
-
 	/* Check if keyring loaded and the current master key
 	can be fetched. */
 	if (Encryption::master_key_id != 0) {
@@ -7410,8 +7588,32 @@ store_binlog_info(
 	return(true);
 }
 
+
+/**************************************************************************
+Store current master key ID.
+@return 'false' on error. */
+static bool
+store_master_key_id(
+/*==============*/
+	const char *filename)	/*!< in: output file name */
+{
+	FILE *fp;
+
+	fp = fopen(filename, "w");
+
+	if (!fp) {
+		msg("xtrabackup: failed to open '%s'\n", filename);
+		return(false);
+	}
+
+	fprintf(fp, "%lu", Encryption::master_key_id);
+	fclose(fp);
+
+	return(true);
+}
+
 static void
-xtrabackup_prepare_func(void)
+xtrabackup_prepare_func(int argc, char **argv)
 {
 	ulint	err;
 	datafiles_iter_t	*it;
@@ -7484,7 +7686,11 @@ skip_check:
 		}
 	}
 
-	/* Create logfiles for recovery from 'xtrabackup_logfile', before start InnoDB */
+        if (xtrabackup_incremental) {
+		backup_redo_log_flushed_lsn = incremental_flushed_lsn;
+        }
+
+        /* Create logfiles for recovery from 'xtrabackup_logfile', before start InnoDB */
 	srv_max_n_threads = 1000;
 	/* temporally dummy value to avoid crash */
 	srv_page_size_shift = 14;
@@ -7506,7 +7712,37 @@ skip_check:
 		goto error_cleanup;
 	}
 
-	xb_keyring_init(xb_keyring_file_data);
+	if (opt_transition_key && !xb_tablespace_keys_exist()) {
+		msg("xtrabackup: Error: --transition-key specified, but "
+		    "xtrabackup_keys is not found.\n");
+		goto error_cleanup;
+	}
+
+	if (opt_transition_key) {
+		if (!xb_tablespace_keys_load(
+			xtrabackup_incremental,
+			opt_transition_key, strlen(opt_transition_key))) {
+			msg("xtrabackup: Error: failed to load tablespace "
+			    "keys\n");
+			goto error_cleanup;
+		}
+	} else {
+		if (!xb_keyring_init_for_prepare(argc, argv)) {
+			msg("xtrabackup: Error: failed to init keyring "
+			    "plugin\n");
+			goto error_cleanup;
+		}
+		if (xb_tablespace_keys_exist()) {
+			use_dumped_tablespace_keys = true;
+			if (!xb_tablespace_keys_load(
+				xtrabackup_incremental,
+				NULL, 0)) {
+				msg("xtrabackup: Error: failed to load "
+				    "tablespace keys\n");
+				goto error_cleanup;
+			}
+		}
+	}
 
 	/* Expand compacted datafiles */
 
@@ -7634,7 +7870,7 @@ skip_check:
 
 	if (xtrabackup_export) {
 		msg("xtrabackup: export option is specified.\n");
-		os_file_t	info_file = XB_FILE_UNDEFINED;
+		pfs_os_file_t	info_file = XB_FILE_UNDEFINED;
 		char		info_file_path[FN_REFLEN];
 		bool		success;
 		char		table_name[FN_REFLEN];
@@ -7804,6 +8040,10 @@ next_node:
 		exit(EXIT_FAILURE);
 	}
 
+	if (!store_master_key_id("xtrabackup_master_key_id")) {
+		exit(EXIT_FAILURE);
+	}
+
 	if (innobase_log_arch_dir)
 		srv_start_lsn = log_sys->lsn = recv_sys->recovered_lsn;
 
@@ -7937,6 +8177,10 @@ next_node:
 
 	}
 
+	if (!use_dumped_tablespace_keys) {
+		xb_keyring_shutdown();
+	}
+
 	mysql_mutex_destroy(&LOCK_global_system_variables);
 
 	xb_filters_free();
@@ -7944,6 +8188,11 @@ next_node:
 	return;
 
 error_cleanup:
+
+	if (!use_dumped_tablespace_keys) {
+		xb_keyring_shutdown();
+	}
+
 	xtrabackup_close_temp_log(FALSE);
 
 	mysql_mutex_destroy(&LOCK_global_system_variables);
@@ -8014,6 +8263,11 @@ xb_init()
 	int n_mixed_options;
 
 	/* sanity checks */
+	if (opt_lock_ddl && opt_lock_ddl_per_table) {
+		msg("Error: %s and %s are mutually exclusive\n",
+		    "--lock-ddl", "--lock-ddl-per-table");
+		return(false);
+	}
 
 	if (opt_slave_info
 		&& opt_no_lock
@@ -8026,6 +8280,12 @@ xb_init()
 
 	if (opt_rsync && xtrabackup_stream_fmt) {
 		msg("Error: --rsync doesn't work with --stream\n");
+		return(false);
+	}
+
+	if (opt_transition_key && opt_generate_transition_key) {
+		msg("Error: options --transition-key and "
+		    "--generate-transition-key are mutually exclusive.\n");
 		return(false);
 	}
 
@@ -8057,9 +8317,11 @@ xb_init()
 
 	if (xtrabackup_backup) {
 
+#ifdef HAVE_VERSION_CHECK
 		if (!opt_noversioncheck) {
 			version_check();
 		}
+#endif
 
 		if ((mysql_connection = xb_mysql_connect()) == NULL) {
 			return(false);
@@ -8076,9 +8338,9 @@ xb_init()
 		history_start_time = time(NULL);
 
 		if (opt_lock_ddl &&
-			!lock_tables_for_backup(mysql_connection,
-				opt_lock_ddl_timeout)) {
-			return(false);
+		    !lock_tables_for_backup(mysql_connection,
+					    opt_lock_ddl_timeout, 0)) {
+			return (false);
 		}
 
 		parse_show_engine_innodb_status(mysql_connection);
@@ -8305,17 +8567,18 @@ check_all_privileges()
 }
 
 void
-handle_options(int argc, char **argv, char ***argv_client, char ***argv_server)
+handle_options(int argc, char **argv, int *argc_client, char ***argv_client,
+	       int *argc_server, char ***argv_server)
 {
 	int	i;
 	int	ho_error;
 	char	conf_file[FN_REFLEN];
-	int	argc_client = argc;
-	int	argc_server = argc;
 
 	char*	target_dir = NULL;
 	bool	prepare = false;
 
+	*argc_client = argc;
+	*argc_server = argc;
 	*argv_client = argv;
 	*argv_server = argv;
 
@@ -8366,7 +8629,7 @@ handle_options(int argc, char **argv, char ***argv_client, char ***argv_server)
 			 "%s/backup-my.cnf", target_dir);
 	}
 	if (load_defaults(conf_file, xb_server_default_groups,
-			  &argc_server, argv_server)) {
+			  argc_server, argv_server)) {
 		exit(EXIT_FAILURE);
 	}
 
@@ -8408,41 +8671,49 @@ handle_options(int argc, char **argv, char ***argv_client, char ***argv_server)
 		}
 	}
 
-	if (argc_server > 0
-	    && (ho_error=handle_options(&argc_server, argv_server,
+	if (*argc_server > 0
+	    && (ho_error=handle_options(argc_server, argv_server,
 					xb_server_options, xb_get_one_option)))
 		exit(ho_error);
 
+	msg("xtrabackup: recognized server arguments: %s\n",
+	    param_str.str().c_str());
+	param_str.str("");
+
 	if (load_defaults(conf_file, xb_client_default_groups,
-			  &argc_client, argv_client)) {
+			  argc_client, argv_client)) {
 		exit(EXIT_FAILURE);
 	}
 
 	if (strcmp(base_name(my_progname), INNOBACKUPEX_BIN_NAME) == 0 &&
-	    argc_client > 0) {
+	    *argc_client > 0) {
 		/* emulate innobackupex script */
 		innobackupex_mode = true;
-		if (!ibx_handle_options(&argc_client, argv_client)) {
+		if (!ibx_handle_options(argc_client, argv_client)) {
 			exit(EXIT_FAILURE);
 		}
 	}
 
-	if (argc_client > 0
-	    && (ho_error=handle_options(&argc_client, argv_client,
+	if (*argc_client > 0
+	    && (ho_error=handle_options(argc_client, argv_client,
 					xb_client_options, xb_get_one_option)))
 		exit(ho_error);
+
+	msg("xtrabackup: recognized client arguments: %s\n",
+	    param_str.str().c_str());
+	param_str.clear();
 
 	/* Reject command line arguments that don't look like options, i.e. are
 	not of the form '-X' (single-character options) or '--option' (long
 	options) */
-	for (int i = 0 ; i < argc_client ; i++) {
+	for (int i = 0 ; i < *argc_client ; i++) {
 		const char * const opt = (*argv_client)[i];
 
 		if (strncmp(opt, "--", 2) &&
 		    !(strlen(opt) == 2 && opt[0] == '-')) {
 			bool server_option = true;
 
-			for (int j = 0; j < argc_server; j++) {
+			for (int j = 0; j < *argc_server; j++) {
 				if (opt == (*argv_server)[j]) {
 					server_option = false;
 					break;
@@ -8456,6 +8727,49 @@ handle_options(int argc, char **argv, char ***argv_client, char ***argv_server)
 			}
 		}
 	}
+
+	if (tty_password) {
+		opt_password = get_tty_password(NullS);
+	}
+
+	if (tty_transition_key) {
+		opt_transition_key = get_tty_password("Enter transition key: ");
+	}
+}
+
+void setup_error_messages()
+{
+	static const char *all_msgs[4000];
+	my_default_lc_messages = &my_locale_en_US;
+	my_default_lc_messages->errmsgs->errmsgs = all_msgs;
+
+	struct {
+		int id;
+		const char *fmt;
+	}
+	xb_msgs[] = {
+		{ ER_DATABASE_NAME,"Database" },
+		{ ER_TABLE_NAME,"Table"},
+		{ ER_PARTITION_NAME, "Partition" },
+		{ ER_SUBPARTITION_NAME, "Subpartition" },
+		{ ER_TEMPORARY_NAME, "Temporary"},
+		{ ER_RENAMED_NAME, "Renamed"},
+		{ ER_CANT_FIND_DL_ENTRY, "Can't find symbol '%-.128s' in library"},
+		{ ER_CANT_OPEN_LIBRARY, "Can't open shared library '%-.192s' (errno: %d, %-.128s)" },
+		{ ER_OUTOFMEMORY, "Out of memory; restart server and try again (needed %d bytes)" },
+		{ ER_CANT_OPEN_LIBRARY, "Can't open shared library '%-.192s' (errno: %d, %-.128s)" },
+		{ ER_UDF_NO_PATHS, "No paths allowed for shared library" },
+		{ ER_CANT_INITIALIZE_UDF,"Can't initialize function '%-.192s'; %-.80s"},
+		{ ER_PLUGIN_IS_NOT_LOADED,"Plugin '%-.192s' is not loaded" }
+	};
+
+	for (int i = 0; i < (int)array_elements(all_msgs); i++) {
+		all_msgs[i] = "Unknown error";
+	}
+
+	for (int i = 0; i < (int)array_elements(xb_msgs); i++) {
+		all_msgs[xb_msgs[i].id - 1000] = xb_msgs[i].fmt;
+	}
 }
 
 /* ================= main =================== */
@@ -8463,6 +8777,7 @@ handle_options(int argc, char **argv, char ***argv_client, char ***argv_server)
 int main(int argc, char **argv)
 {
 	char **client_defaults, **server_defaults;
+	int client_argc, server_argc;
 	char cwd[FN_REFLEN];
 
 	setup_signals();
@@ -8491,7 +8806,10 @@ int main(int argc, char **argv)
 	system_charset_info= &my_charset_utf8_general_ci;
 	key_map_full.set_all();
 
-	handle_options(argc, argv, &client_defaults, &server_defaults);
+	handle_options(argc, argv, &client_argc, &client_defaults,
+		       &server_argc, &server_defaults);
+
+	xb_libgcrypt_init();
 
 	if (innobackupex_mode) {
 		if (!ibx_init()) {
@@ -8578,7 +8896,8 @@ int main(int argc, char **argv)
 	} else if (xtrabackup_backup && xtrabackup_incremental_basedir) {
 		char	filename[FN_REFLEN];
 
-		sprintf(filename, "%s/%s", xtrabackup_incremental_basedir, XTRABACKUP_METADATA_FILENAME);
+		sprintf(filename, "%s/%s", xtrabackup_incremental_basedir,
+			XTRABACKUP_METADATA_FILENAME);
 
 		if (!xtrabackup_read_metadata(filename)) {
 			msg("xtrabackup: error: failed to read metadata from "
@@ -8591,7 +8910,8 @@ int main(int argc, char **argv)
 	} else if (xtrabackup_prepare && xtrabackup_incremental_dir) {
 		char	filename[FN_REFLEN];
 
-		sprintf(filename, "%s/%s", xtrabackup_incremental_dir, XTRABACKUP_METADATA_FILENAME);
+		sprintf(filename, "%s/%s", xtrabackup_incremental_dir,
+			XTRABACKUP_METADATA_FILENAME);
 
 		if (!xtrabackup_read_metadata(filename)) {
 			msg("xtrabackup: error: failed to read metadata from "
@@ -8602,6 +8922,7 @@ int main(int argc, char **argv)
 		incremental_lsn = metadata_from_lsn;
 		incremental_to_lsn = metadata_to_lsn;
 		incremental_last_lsn = metadata_last_lsn;
+		incremental_flushed_lsn = backup_redo_log_flushed_lsn;
 		xtrabackup_incremental = xtrabackup_incremental_dir; //dummy
 
 	} else if (opt_incremental_history_name) {
@@ -8666,7 +8987,7 @@ int main(int argc, char **argv)
 	if (xtrabackup_throttle && !xtrabackup_backup) {
 		xtrabackup_throttle = 0;
 		msg("xtrabackup: warning: --throttle has effect "
-		    "only with --backup");
+		    "only with --backup\n");
 	}
 
 	if (xtrabackup_backup && xtrabackup_compact) {
@@ -8697,25 +9018,41 @@ int main(int argc, char **argv)
 	}
 #endif
 
+	system_charset_info= &my_charset_utf8_general_ci;
+	files_charset_info= &my_charset_utf8_general_ci;
+	national_charset_info= &my_charset_utf8_general_ci;
+	table_alias_charset= &my_charset_bin;
+	character_set_filesystem= &my_charset_bin;
+
+	sys_var_init();
+	setup_error_messages();
+
 	/* --backup */
-	if (xtrabackup_backup)
+	if (xtrabackup_backup) {
 		xtrabackup_backup_func();
+	}
 
 	/* --stats */
-	if (xtrabackup_stats)
-		xtrabackup_stats_func();
+	if (xtrabackup_stats) {
+		xtrabackup_stats_func(server_argc, server_defaults);
+	}
 
 	/* --prepare */
-	if (xtrabackup_prepare)
-		xtrabackup_prepare_func();
+	if (xtrabackup_prepare) {
+		xtrabackup_prepare_func(server_argc, server_defaults);
+	}
 
 	if (xtrabackup_copy_back || xtrabackup_move_back) {
 		if (!check_if_param_set("datadir")) {
 			msg("Error: datadir must be specified.\n");
 			exit(EXIT_FAILURE);
 		}
-		if (!copy_back())
+		mysql_mutex_init(key_LOCK_keyring_operations,
+				 &LOCK_keyring_operations, MY_MUTEX_INIT_FAST);
+		if (!copy_back(server_argc, server_defaults)) {
 			exit(EXIT_FAILURE);
+		}
+		mysql_mutex_destroy(&LOCK_keyring_operations);
 	}
 
 	if (xtrabackup_decrypt_decompress && !decrypt_decompress()) {

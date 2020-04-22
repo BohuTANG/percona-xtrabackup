@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2018, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -67,7 +67,7 @@ fsp_free_extent(
 /********************************************************************//**
 Marks a page used. The page must reside within the extents of the given
 segment. */
-static MY_ATTRIBUTE((nonnull))
+static
 void
 fseg_mark_page_used(
 /*================*/
@@ -228,7 +228,6 @@ fsp_flags_is_valid(
 	bool	has_data_dir = FSP_FLAGS_HAS_DATA_DIR(flags);
 	bool	is_shared = FSP_FLAGS_GET_SHARED(flags);
 	bool	is_temp = FSP_FLAGS_GET_TEMPORARY(flags);
-	bool	is_encryption = FSP_FLAGS_GET_ENCRYPTION(flags);
 
 	ulint	unused = FSP_FLAGS_GET_UNUSED(flags);
 
@@ -272,12 +271,6 @@ fsp_flags_is_valid(
 	It is not compatible with the TABLESPACE clause.  Nor is it
 	compatible with the TEMPORARY clause. */
 	if (has_data_dir && (is_shared || is_temp)) {
-		return(false);
-	}
-
-	/* Only single-table and not temp tablespaces use the encryption
-	clause. */
-	if (is_encryption && (is_shared || is_temp)) {
 		return(false);
 	}
 
@@ -859,7 +852,6 @@ fsp_header_init_fields(
 /** Get the offset of encrytion information in page 0.
 @param[in]	page_size	page size.
 @return	offset on success, otherwise 0. */
-static
 ulint
 fsp_header_get_encryption_offset(
 	const page_size_t&	page_size)
@@ -918,17 +910,23 @@ fsp_header_fill_encryption_info(
 	/* Write magic header. */
 	if (version == Encryption::ENCRYPTION_VERSION_1) {
 		memcpy(ptr, ENCRYPTION_KEY_MAGIC_V1, ENCRYPTION_MAGIC_SIZE);
-	} else {
+	} else if (version == Encryption::ENCRYPTION_VERSION_2) {
 		memcpy(ptr, ENCRYPTION_KEY_MAGIC_V2, ENCRYPTION_MAGIC_SIZE);
+	} else {
+		memcpy(ptr, ENCRYPTION_KEY_MAGIC_V3, ENCRYPTION_MAGIC_SIZE);
 	}
 	ptr += ENCRYPTION_MAGIC_SIZE;
 
 	/* Write master key id. */
 	mach_write_to_4(ptr, master_key_id);
-	ptr += sizeof(ulint);
+	if (version == Encryption::ENCRYPTION_VERSION_3) {
+		ptr += sizeof(uint32);
+	} else {
+		ptr += sizeof(ulint);
+	}
 
 	/* Write server uuid. */
-	if (version == Encryption::ENCRYPTION_VERSION_2) {
+	if (version != Encryption::ENCRYPTION_VERSION_1) {
 		memcpy(ptr, Encryption::uuid, ENCRYPTION_SERVER_UUID_LEN);
 		ptr += ENCRYPTION_SERVER_UUID_LEN;
 	}
@@ -1005,6 +1003,9 @@ fsp_header_rotate_encryption(
 
 	const page_size_t	page_size(space->flags);
 
+	DBUG_EXECUTE_IF("fsp_header_rotate_encryption_failure",
+			return(false););
+
 	/* Fill encryption info. */
 	if (!fsp_header_fill_encryption_info(space,
 					     encrypt_info)) {
@@ -1034,6 +1035,9 @@ fsp_header_rotate_encryption(
 			     ENCRYPTION_MAGIC_SIZE) == 0
 		      || memcmp(page + offset,
 				ENCRYPTION_KEY_MAGIC_V2,
+				ENCRYPTION_MAGIC_SIZE) == 0
+		      || memcmp(page + offset,
+				ENCRYPTION_KEY_MAGIC_V3,
 				ENCRYPTION_MAGIC_SIZE) == 0);
 		return(true);
 	}
@@ -1212,13 +1216,24 @@ fsp_header_decode_encryption_info(
 	if (memcmp(ptr, ENCRYPTION_KEY_MAGIC_V1,
 		     ENCRYPTION_MAGIC_SIZE) == 0) {
 		version = Encryption::ENCRYPTION_VERSION_1;
-	} else {
+	} else if (memcmp(ptr, ENCRYPTION_KEY_MAGIC_V2,
+			    ENCRYPTION_MAGIC_SIZE) == 0) {
 		version = Encryption::ENCRYPTION_VERSION_2;
+	} else {
+		version = Encryption::ENCRYPTION_VERSION_3;
+	}
+
+	/* check maximum supported version */
+	if (version > Encryption::max_version) {
+		Encryption::max_version = version;
+		ut_a(version <= Encryption::ENCRYPTION_VERSION_3);
 	}
 
 	/* Check magic. */
-	if (version == Encryption::ENCRYPTION_VERSION_2
-	    && memcmp(ptr, ENCRYPTION_KEY_MAGIC_V2, ENCRYPTION_MAGIC_SIZE) != 0) {
+	if (version >= Encryption::ENCRYPTION_VERSION_2
+	    && memcmp(ptr, ENCRYPTION_KEY_MAGIC_V2, ENCRYPTION_MAGIC_SIZE) != 0
+	    && memcmp(ptr, ENCRYPTION_KEY_MAGIC_V3,
+		      ENCRYPTION_MAGIC_SIZE) != 0) {
 		/* We ignore report error for recovery,
 		since the encryption info maybe hasn't writen
 		into datafile when the table is newly created. */
@@ -1232,10 +1247,14 @@ fsp_header_decode_encryption_info(
 
 	/* Get master key id. */
 	master_key_id = mach_read_from_4(ptr);
-	ptr += sizeof(ulint);
+	if (version == Encryption::ENCRYPTION_VERSION_3) {
+		ptr += sizeof(uint32);
+	} else {
+		ptr += sizeof(ulint);
+	}
 
 	/* Get server uuid. */
-	if (version == Encryption::ENCRYPTION_VERSION_2) {
+	if (version >= Encryption::ENCRYPTION_VERSION_2) {
 		memset(srv_uuid, 0, ENCRYPTION_SERVER_UUID_LEN + 1);
 		memcpy(srv_uuid, ptr, ENCRYPTION_SERVER_UUID_LEN);
 		ptr += ENCRYPTION_SERVER_UUID_LEN;
@@ -1279,8 +1298,9 @@ fsp_header_decode_encryption_info(
 	crc1 = mach_read_from_4(ptr);
 	crc2 = ut_crc32(key_info, ENCRYPTION_KEY_LEN * 2);
 	if (crc1 != crc2) {
-		ib::error() << "Failed to decrpt encryption information,"
-			<< " please check key file is not changed!";
+		ib::error() << "Failed to decrypt encryption information,"
+			<< " please confirm the master key was not changed.";
+		my_free(master_key);
 		return(false);
 	}
 
@@ -1437,7 +1457,7 @@ fsp_try_extend_data_file_with_pages(
 @param[in,out]	header	tablespace header
 @param[in,out]	mtr	mini-transaction
 @return whether the tablespace was extended */
-static UNIV_COLD MY_ATTRIBUTE((nonnull))
+static UNIV_COLD
 ulint
 fsp_try_extend_data_file(
 	fil_space_t*	space,
@@ -1802,7 +1822,7 @@ fsp_alloc_free_extent(
 
 /**********************************************************************//**
 Allocates a single free page from a space. */
-static MY_ATTRIBUTE((nonnull))
+static
 void
 fsp_alloc_from_free_frag(
 /*=====================*/
@@ -3506,7 +3526,7 @@ fsp_get_available_space_in_free_extents(
 /********************************************************************//**
 Marks a page used. The page must reside within the extents of the given
 segment. */
-static MY_ATTRIBUTE((nonnull))
+static
 void
 fseg_mark_page_used(
 /*================*/

@@ -1,5 +1,5 @@
 /******************************************************
-Copyright (c) 2013 Percona LLC and/or its affiliates.
+Copyright (c) 2013,2020 Percona LLC and/or its affiliates.
 
 The xbcrypt utility: decrypt files in the XBCRYPT format.
 
@@ -48,13 +48,11 @@ static char 		*opt_input_file = NULL;
 static char 		*opt_output_file = NULL;
 static ulong 		opt_encrypt_algo;
 static char 		*opt_encrypt_key_file = NULL;
-static void 		*opt_encrypt_key = NULL;
+static char 		*opt_encrypt_key = NULL;
 static ulonglong	opt_encrypt_chunk_size = 0;
 static my_bool		opt_verbose = FALSE;
 static uint 		opt_encrypt_threads = 1;
 static uint		opt_read_buffer_size = 0;
-
-static uint 		encrypt_key_len = 0;
 
 static struct my_option my_long_options[] =
 {
@@ -79,8 +77,7 @@ static struct my_option my_long_options[] =
 	 &opt_encrypt_algo, &opt_encrypt_algo, &xbcrypt_encrypt_algo_typelib,
 	 GET_ENUM, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
 
-	{"encrypt-key", 'k', "Encryption key.",
-	 &opt_encrypt_key, &opt_encrypt_key, 0,
+	{"encrypt-key", 'k', "Encryption key", 0, 0, 0,
 	 GET_STR_ALLOC, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
 
 	{"encrypt-key-file", 'f', "File which contains encryption key.",
@@ -155,31 +152,13 @@ main(int argc, char **argv)
 
 	MY_INIT(argv[0]);
 
-	crc_init();
-
 	if (get_options(&argc, &argv)) {
 		goto cleanup;
 	}
-	/* Now set up the key */
-	if (opt_encrypt_key == NULL && opt_encrypt_key_file == NULL) {
-		msg("%s: no encryption key or key file specified.\n",
-		    my_progname);
-		return 1;
-	} else if (opt_encrypt_key && opt_encrypt_key_file) {
-		msg("%s: both encryption key and key file specified.\n",
-		    my_progname);
-		return 1;
-	} else if (opt_encrypt_key_file) {
-		if (!xb_crypt_read_key_file(opt_encrypt_key_file,
-					    &opt_encrypt_key,
-					    &encrypt_key_len)) {
-			msg("%s: unable to read encryption key file \"%s\".\n",
-			    opt_encrypt_key_file, my_progname);
-			return 1;
-		}
-	} else {
-		encrypt_key_len = strlen(opt_encrypt_key);
-	}
+
+	xb_libgcrypt_init();
+
+	crc_init();
 
 	if (opt_input_file) {
 		MY_STAT 	input_file_stat;
@@ -270,8 +249,8 @@ cleanup:
 		my_close(filein, MYF(MY_WME));
 	}
 
-	if (fileout) {
-		ds_close(fileout);
+	if (fileout && ds_close(fileout)) {
+		result = EXIT_FAILURE;
 	}
 	if (crypto_ds) {
 		ds_destroy(crypto_ds);
@@ -357,6 +336,9 @@ get_one_option(int optid, const struct my_option *opt __attribute__((unused)),
 	switch (optid) {
 	case 'd':
 		opt_run_mode = RUN_MODE_DECRYPT;
+		break;
+	case 'k':
+		hide_option(argument, &opt_encrypt_key);
 		break;
 	case '?':
 		usage();
