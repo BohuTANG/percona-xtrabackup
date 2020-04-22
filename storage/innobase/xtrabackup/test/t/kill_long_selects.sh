@@ -4,10 +4,9 @@
 
 . inc/common.sh
 
-if [ ${ASAN_OPTIONS:-undefined} != "undefined" ]
-then
-    skip_test "Incompatible with AddressSanitizer"
-fi
+MYSQLD_EXTRA_MY_CNF_OPTS="
+secure-file-priv=$TEST_VAR_ROOT
+"
 
 function bg_run()
 {
@@ -94,7 +93,7 @@ function wait_for_connection_count()
   done
 }
 
-start_server --innodb_file_per_table
+start_server
 
 has_backup_locks && skip_test "Requires a server without backup locks support"
 

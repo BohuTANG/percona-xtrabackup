@@ -85,6 +85,15 @@ do
     check_for_value "$column" "N"
 done
 
+get_one_value "lock_time"
+lock_time_without_lock=$val
+
+if [ $val -lt 0 ];
+then	
+    vlog "Error: lock_time in history record invalid, expected > 0, got \"$val\""
+    exit 1
+fi
+
 check_for_value "format" "tar"
 
 # saving for later
@@ -102,7 +111,7 @@ vlog "Testing incremental based on history name"
 multi_row_insert incremental_sample.test \({101..200},100\)
 
 innobackupex --history=test1 --incremental \
---incremental-history-name=test1 $backup_dir > /dev/null
+--incremental-history-name=test1 --no-lock $backup_dir > /dev/null
 
 # saving for later
 get_one_value "uuid"
@@ -111,6 +120,8 @@ get_one_value "innodb_from_lsn"
 second_from_lsn=$val
 get_one_value "innodb_to_lsn"
 second_to_lsn=$val
+
+check_for_value "lock_time" "0"
 
 check_for_value "format" "file"
 check_for_value "incremental" "Y"
@@ -159,7 +170,8 @@ multi_row_insert incremental_sample.test \({301..400},100\)
 
 innobackupex --history --incremental --incremental-history-uuid=$third_uuid \
 --stream=xbstream --compress --encrypt=AES256 \
---encrypt-key=percona_xtrabackup_is_awesome___ $backup_dir > /dev/null
+--encrypt-key=percona_xtrabackup_is_awesome___ --transition-key=percona \
+$backup_dir > /dev/null
 
 get_one_value "innodb_from_lsn"
 fourth_from_lsn=$val
@@ -178,7 +190,7 @@ get_one_value "tool_command"
 val=`set -- $val; shift 2; echo "$@"`
 expected_val="--history --incremental "\
 "--incremental-history-uuid=$third_uuid --stream=xbstream --compress "\
-"--encrypt=AES256 --encrypt-key=... $backup_dir"
+"--encrypt=AES256 --encrypt-key=... --transition-key=... $backup_dir"
 
 if [ -z "$val" ] || [ "$val" != "$expected_val" ]
 then

@@ -1,4 +1,4 @@
-# Copyright (c) 2015 Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2015, 2018, Oracle and/or its affiliates. All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -13,63 +13,35 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
 
-
-# Exclude mysqlpump tool from being compiled by SunStudio compiler. It has bug
-# that forbids usage of pure virtual interfaces (and other classes with no
-# fields) without dummy workarounds. In fact, only libmysql must be build with
-# this toolset, so it is acceptable to exclude mysqlpump here.
+INCLUDE(${MYSQL_CMAKE_SCRIPT_DIR}/compile_flags.cmake)
 
 INCLUDE_DIRECTORIES(
   ${CMAKE_SOURCE_DIR}/dump
 )
 
-IF (CMAKE_CXX_COMPILER_ID STREQUAL "SunPro")
-  RETURN()
-ENDIF()
-
-# Prevent Boost from including external precompiled Boost libraries, use
-# threading (not implemented for Solaris) and turn off unused functionality.
+# Prevent Boost from including external precompiled Boost libraries,
+# and turn off unused functionality.
 IF(USING_LOCAL_BOOST)
   ADD_DEFINITIONS(
     -DBOOST_ALL_NO_LIB
     -DBOOST_SYSTEM_NO_DEPRECATED)
 ENDIF()
 
-IF(WIN32)
-  LIST(APPEND BOOST_THREAD_SOURCES
-    ${BOOST_SOURCES_DIR}/libs/thread/src/win32/thread.cpp
-    ${BOOST_SOURCES_DIR}/libs/thread/src/win32/tss_dll.cpp
-    ${BOOST_SOURCES_DIR}/libs/thread/src/win32/tss_pe.cpp
-  )
-ELSE()
-  LIST(APPEND BOOST_THREAD_SOURCES
-    ${BOOST_SOURCES_DIR}/libs/thread/src/pthread/once.cpp
-    ${BOOST_SOURCES_DIR}/libs/thread/src/pthread/thread.cpp
-  )
-ENDIF()
-
 SET(BOOST_LIB_SOURCES
-  ${BOOST_SOURCES_DIR}/libs/atomic/src/lockpool.cpp
   ${BOOST_SOURCES_DIR}/libs/chrono/src/chrono.cpp
-  ${BOOST_SOURCES_DIR}/libs/chrono/src/process_cpu_clocks.cpp
-  ${BOOST_SOURCES_DIR}/libs/chrono/src/thread_clock.cpp
   ${BOOST_SOURCES_DIR}/libs/system/src/error_code.cpp
-  ${BOOST_SOURCES_DIR}/libs/thread/src/future.cpp
 )
 
-IF(USING_LOCAL_BOOST)
-  ADD_CONVENIENCE_LIBRARY(boost_lib ${BOOST_LIB_SOURCES} ${BOOST_THREAD_SOURCES})
+INCLUDE_DIRECTORIES(SYSTEM
+  ${BOOST_PATCHES_DIR}
+  ${BOOST_INCLUDE_DIR}
+  )
 
-  SET_TARGET_PROPERTIES(boost_lib
-    PROPERTIES COMPILE_FLAGS "-DBOOST_THREAD_BUILD_LIB")
+IF(USING_LOCAL_BOOST)
+  ADD_CONVENIENCE_LIBRARY(boost_lib ${BOOST_LIB_SOURCES})
+
   # Do not build library unless it is needed by some other target.
   SET_PROPERTY(TARGET boost_lib PROPERTY EXCLUDE_FROM_ALL TRUE)
-
-  ADD_COMPILE_FLAGS(
-    ${BOOST_LIB_SOURCES}
-    ${BOOST_THREAD_SOURCES}
-    COMPILE_FLAGS -I${BOOST_PATCHES_DIR} -isystem ${BOOST_INCLUDE_DIR}
-    )
 
   IF(HAVE_clock_gettime_IN_rt)
     TARGET_LINK_LIBRARIES(boost_lib ${LIBRT})
@@ -162,45 +134,11 @@ TARGET_LINK_LIBRARIES(mysqlpump_lib
    client_base ${LZ4_LIBRARY})
 
 ADD_COMPILE_FLAGS(
-  ${MYSQLPUMP_LIB_SOURCES}
-  COMPILE_FLAGS -I${BOOST_PATCHES_DIR} -isystem ${BOOST_INCLUDE_DIR}
-  )
-
-# Files that use Boost sources that trigger compilation warnings
-SET(MYSQLPUMP_BOOST_SOURCES
-  ${BOOST_SOURCES_DIR}/libs/thread/src/pthread/once.cpp
-  ${BOOST_SOURCES_DIR}/libs/thread/src/pthread/thread.cpp
-  abstract_crawler.cc
-  abstract_mysql_chain_element_extension.cc
-  abstract_progress_watcher.cc
-  mysql_chain_element_options.cc
-  mysql_object_reader.cc
-  mysqldump_tool_chain_maker.cc
-  mysqldump_tool_chain_maker_options.cc
-  object_filter.cc
-  object_queue.cc
-  program.cc
-  standard_progress_watcher.cc
-  sql_formatter.cc
-  table.cc
-)
-
-# Boost source has unused local typedefs.
-MY_CHECK_CXX_COMPILER_FLAG("-Wunused-local-typedefs" HAVE_UNUSED_TYPEDEFS)
-IF(HAVE_UNUSED_TYPEDEFS)
-  ADD_COMPILE_FLAGS(${MYSQLPUMP_BOOST_SOURCES}
-    COMPILE_FLAGS "-Wno-unused-local-typedefs")
-ENDIF()
-
-ADD_COMPILE_FLAGS(
   compression_writer.cc
   mysqldump_tool_chain_maker.cc
   COMPILE_FLAGS -I${LZ4_INCLUDE_DIR}
 )
 MYSQL_ADD_EXECUTABLE(mysqlpump  program.cc)
-ADD_COMPILE_FLAGS(
-  program.cc COMPILE_FLAGS -I${BOOST_PATCHES_DIR} -isystem ${BOOST_INCLUDE_DIR}
-)
 
 TARGET_LINK_LIBRARIES(mysqlpump mysqlpump_lib ${LOCAL_BOOST_LIB})
 IF(USING_SYSTEM_BOOST)
@@ -209,12 +147,3 @@ IF(USING_SYSTEM_BOOST)
 ENDIF()
 
 SET_TARGET_PROPERTIES(mysqlpump PROPERTIES HAS_CXX TRUE)
-
-# Store the executable in our parent directory.
-# Why? In pushbuild we do 'touch client/mysql*' to prevent rebuild,
-#      in the case where we have a separate build of libmysqlclient.so
-IF (NOT WIN32)
-  SET_TARGET_PROPERTIES(mysqlpump
-    PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/client)
-ENDIF()
-

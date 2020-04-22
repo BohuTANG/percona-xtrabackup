@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2016, 2018, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -663,7 +663,6 @@ rtr_adjust_upper_level(
 
 	/* Create a memory heap where the data tuple is stored */
 	heap = mem_heap_create(1024);
-	memset(&cursor, 0, sizeof(cursor));
 
 	cursor.thr = sea_cur->thr;
 
@@ -725,8 +724,6 @@ rtr_adjust_upper_level(
 		node_ptr_upper, &rec, &dummy_big_rec, 0, NULL, mtr);
 
 	if (err == DB_FAIL) {
-		ut_ad(!cursor.rtr_info);
-
 		cursor.rtr_info = sea_cur->rtr_info;
 		cursor.tree_height = sea_cur->tree_height;
 
@@ -1027,6 +1024,7 @@ rtr_page_split_and_insert(
 	lock_prdt_t		new_prdt;
 	rec_t*			first_rec = NULL;
 	int			first_rec_group = 1;
+	ulint			n_iterations = 0;
 
 	if (!*heap) {
 		*heap = mem_heap_create(1024);
@@ -1231,6 +1229,15 @@ func_start:
 	page_cur_search(insert_block, cursor->index, tuple,
 			PAGE_CUR_LE, page_cursor);
 
+	/* It's possible that the new record is too big to be inserted into
+	the page, and it'll need the second round split in this case.
+	We test this scenario here*/
+	DBUG_EXECUTE_IF("rtr_page_need_second_split",
+			if (n_iterations == 0) {
+				rec = NULL;
+				goto after_insert; }
+	);
+
 	rec = page_cur_tuple_insert(page_cursor, tuple, cursor->index,
 				    offsets, heap, n_ext, mtr);
 
@@ -1249,6 +1256,9 @@ func_start:
 		again. */
 	}
 
+#ifdef UNIV_DEBUG
+after_insert:
+#endif
 	/* Calculate the mbr on the upper half-page, and the mbr on
 	original page. */
 	rtr_page_cal_mbr(cursor->index, block, &mbr, *heap);
@@ -1281,6 +1291,7 @@ func_start:
 			block, new_block, mtr);
 	}
 
+
 	/* If the new res insert fail, we need to do another split
 	 again. */
 	if (!rec) {
@@ -1291,9 +1302,12 @@ func_start:
 			ibuf_reset_free_bits(block);
 		}
 
-		*offsets = rtr_page_get_father_block(
-                                NULL, *heap, cursor->index, block, mtr,
-				NULL, cursor);
+		/* We need to clean the parent path here and search father
+		node later, otherwise, it's possible that find a wrong
+		parent. */
+		rtr_clean_rtr_info(cursor->rtr_info, true);
+		cursor->rtr_info = NULL;
+		n_iterations++;
 
 		rec_t* i_rec = page_rec_get_next(page_get_infimum_rec(
 			buf_block_get_frame(block)));
@@ -1331,7 +1345,6 @@ rtr_ins_enlarge_mbr(
 	page_cur_t*		page_cursor;
 	ulint*			offsets;
 	node_visit_t*		node_visit;
-	btr_cur_t		cursor;
 	page_t*			page;
 
 	ut_ad(dict_index_is_spatial(index));
@@ -1365,7 +1378,7 @@ rtr_ins_enlarge_mbr(
 		rtr_page_cal_mbr(index, block, &new_mbr, heap);
 
 		/* Get father block. */
-		memset(&cursor, 0, sizeof(cursor));
+		btr_cur_t cursor;
 		offsets = rtr_page_get_father_block(
 			NULL, heap, index, block, mtr, btr_cur, &cursor);
 

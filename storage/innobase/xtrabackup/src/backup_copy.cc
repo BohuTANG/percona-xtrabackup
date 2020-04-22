@@ -47,11 +47,12 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <srv0start.h>
 #include <srv0srv.h>
 #include <fil0fil.h>
+#include <page0page.h>
 #include <fsp0sysspace.h>
 #include <set>
 #include <string>
 #include <mysqld.h>
-#include <version_check_pl.h>
+#include <my_default.h>
 #include <sstream>
 #include <algorithm>
 #include "fil_cur.h"
@@ -60,6 +61,13 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "common.h"
 #include "backup_copy.h"
 #include "backup_mysql.h"
+#include "keyring_plugins.h"
+#include "xb0xb.h"
+#include "xtrabackup_version.h"
+#include "xtrabackup_config.h"
+#ifdef HAVE_VERSION_CHECK
+#include <version_check_pl.h>
+#endif
 
 using std::min;
 
@@ -67,6 +75,14 @@ using std::min;
 static std::set<std::string> rsync_list;
 /* locations of tablespaces read from .isl files */
 static std::map<std::string, std::string> tablespace_locations;
+
+/* the purpose of file copied */
+enum file_purpose_t {
+	FILE_PURPOSE_DATAFILE,
+	FILE_PURPOSE_REDO_LOG,
+	FILE_PURPOSE_UNDO_LOG,
+	FILE_PURPOSE_OTHER
+};
 
 /************************************************************************
 Struct represents file or directory. */
@@ -119,7 +135,7 @@ Retirn true if character if file separator */
 bool
 is_path_separator(char c)
 {
-	return(c == FN_LIBCHAR || c == FN_LIBCHAR2);
+	return is_directory_separator(c);
 }
 
 
@@ -490,7 +506,7 @@ datafile_open(const char *file, datafile_cur_t *cursor, uint thread_n)
 		xb_get_relative_path(cursor->abs_path, FALSE),
 		sizeof(cursor->rel_path));
 
-	cursor->fd = my_open(cursor->abs_path, O_RDONLY, MYF(MY_WME));
+	cursor->fd = my_open(cursor->abs_path, O_RDONLY | O_BINARY, MYF(MY_WME));
 
 	if (cursor->fd == -1) {
 		/* The following call prints an error message */
@@ -1215,6 +1231,122 @@ tablespace_filepath(const char *ibd_filepath)
 
 
 /************************************************************************
+Fix InnoDB page checksum after modifying it. */
+static
+void
+page_checksum_fix(byte *page, const page_size_t &page_size)
+{
+	ib_uint32_t checksum = BUF_NO_CHECKSUM_MAGIC;
+
+	if (page_size.is_compressed()) {
+		const uint32_t checksum = page_zip_calc_checksum(
+			page, page_size.physical(),
+			static_cast<srv_checksum_algorithm_t>(
+				srv_checksum_algorithm));
+
+		mach_write_to_4(page + FIL_PAGE_SPACE_OR_CHKSUM, checksum);
+	} else {
+		switch ((srv_checksum_algorithm_t)srv_checksum_algorithm) {
+		case SRV_CHECKSUM_ALGORITHM_CRC32:
+		case SRV_CHECKSUM_ALGORITHM_STRICT_CRC32:
+			checksum = buf_calc_page_crc32(page);
+			mach_write_to_4(page + FIL_PAGE_SPACE_OR_CHKSUM,
+					checksum);
+			break;
+		case SRV_CHECKSUM_ALGORITHM_INNODB:
+		case SRV_CHECKSUM_ALGORITHM_STRICT_INNODB:
+			checksum =
+				(ib_uint32_t)buf_calc_page_new_checksum(page);
+			mach_write_to_4(page + FIL_PAGE_SPACE_OR_CHKSUM,
+					checksum);
+			checksum =
+				(ib_uint32_t)buf_calc_page_old_checksum(page);
+			break;
+		case SRV_CHECKSUM_ALGORITHM_NONE:
+		case SRV_CHECKSUM_ALGORITHM_STRICT_NONE:
+			mach_write_to_4(page + FIL_PAGE_SPACE_OR_CHKSUM,
+					checksum);
+			break;
+			/* no default so the compiler will emit a warning if
+			new enum is added and not handled here */
+		}
+
+		mach_write_to_4(page + UNIV_PAGE_SIZE -
+					FIL_PAGE_END_LSN_OLD_CHKSUM,
+				checksum);
+	}
+
+	ut_ad(!buf_page_is_corrupted(false, page, page_size, false));
+}
+
+/************************************************************************
+Reencrypt datafile header with new master key for copy-back.
+@return true in case of success. */
+static
+bool
+reencrypt_datafile_header(const char *dir, const char *filepath, uint thread_n)
+{
+	char fullpath[FN_REFLEN];
+	byte buf[UNIV_PAGE_SIZE_MAX * 2];
+	byte encrypt_info[ENCRYPTION_INFO_SIZE_V2];
+	fil_space_t space;
+
+	fn_format(fullpath, filepath, dir, "", MYF(MY_RELATIVE_PATH));
+
+	byte *page = static_cast<byte *>(ut_align(buf, UNIV_PAGE_SIZE_MAX));
+
+	File fd = my_open(fullpath, O_RDWR | O_BINARY, MYF(MY_FAE));
+
+	my_seek(fd, 0L, SEEK_SET, MYF(MY_WME));
+
+	size_t len = my_read(fd, page, UNIV_PAGE_SIZE_MAX, MYF(MY_WME));
+
+	if (len < UNIV_PAGE_SIZE_MIN) {
+		my_close(fd, MYF(MY_FAE));
+		return(false);
+	}
+
+	ulint flags = fsp_header_get_flags(page);
+
+	if (!FSP_FLAGS_GET_ENCRYPTION(flags)) {
+		my_close(fd, MYF(MY_FAE));
+		return(true);
+	}
+
+	msg_ts("[%02u] Encrypting %s tablespace header with new "
+	       "master key.\n", thread_n, fullpath);
+
+	memset(encrypt_info, 0, ENCRYPTION_INFO_SIZE_V2);
+
+	space.id = page_get_space_id(page);
+	xb_fetch_tablespace_key(space.id,
+		space.encryption_key, space.encryption_iv);
+	space.encryption_type = Encryption::AES;
+	space.encryption_klen = ENCRYPTION_KEY_LEN;
+
+	const page_size_t page_size(fsp_header_get_page_size(page));
+
+	if (!fsp_header_fill_encryption_info(&space, encrypt_info)) {
+		my_close(fd, MYF(MY_FAE));
+		return(false);
+	}
+
+	ulint offset = fsp_header_get_encryption_offset(page_size);
+
+	memcpy(page + offset, encrypt_info, ENCRYPTION_INFO_SIZE_V2);
+
+	page_checksum_fix(page, page_size);
+
+	my_seek(fd, 0L, SEEK_SET, MYF(MY_WME));
+	my_write(fd, page, len, MYF(MY_FAE | MY_NABP));
+
+	my_close(fd, MYF(MY_FAE));
+
+	return(true);
+}
+
+
+/************************************************************************
 Copy or move file depending on current mode.
 @return true in case of success. */
 static
@@ -1222,7 +1354,8 @@ bool
 copy_or_move_file(const char *src_file_path,
 		  const char *dst_file_path,
 		  const char *dst_dir,
-		  uint thread_n)
+		  uint thread_n,
+		  file_purpose_t file_purpose)
 {
 	ds_ctxt_t *datasink = ds_data;		/* copy to datadir by default */
 	char filedir[FN_REFLEN];
@@ -1274,6 +1407,11 @@ copy_or_move_file(const char *src_file_path,
 		copy_file(datasink, src_file_path, dst_file_path, thread_n) :
 		move_file(datasink, src_file_path, dst_file_path,
 			  dst_dir, thread_n));
+
+	if (opt_generate_new_master_key &&
+	    file_purpose == FILE_PURPOSE_DATAFILE) {
+		reencrypt_datafile_header(dst_dir, dst_file_path, thread_n);
+	}
 
 cleanup:
 
@@ -1350,6 +1488,12 @@ backup_files(const char *from, bool prep_mode)
 		int err;
 
 		if (buffer_pool_filename && file_exists(buffer_pool_filename)) {
+			/* Check if dump of buffer pool has completed
+			and potentially wait for it to complete
+			is only executed before FTWRL - prep_mode */
+			if (prep_mode && opt_dump_innodb_buffer_pool) {
+				check_dump_innodb_buffer_pool(mysql_connection);
+			}
 			fprintf(rsync_tmpfile, "%s\n", buffer_pool_filename);
 			rsync_list.insert(buffer_pool_filename);
 		}
@@ -1374,7 +1518,7 @@ backup_files(const char *from, bool prep_mode)
 
 		if (!prep_mode && !opt_no_lock) {
 			char path[FN_REFLEN];
-			char dst_path[FN_REFLEN];
+			char dst_path[FN_REFLEN * 2 + 2];
 			char *newline;
 
 			/* Remove files that have been removed between first and
@@ -1561,7 +1705,9 @@ backup_start()
 
 		history_lock_time = time(NULL);
 
-		if (!lock_tables_maybe(mysql_connection)) {
+		if (!lock_tables_maybe(mysql_connection,
+				       opt_backup_lock_timeout,
+				       opt_backup_lock_retry_count)) {
 			return(false);
 		}
 	}
@@ -1582,7 +1728,8 @@ backup_start()
 	}
 
 	if (opt_slave_info) {
-		lock_binlog_maybe(mysql_connection);
+		lock_binlog_maybe(mysql_connection, opt_backup_lock_timeout,
+				  opt_backup_lock_retry_count);
 
 		if (!write_slave_info(mysql_connection)) {
 			return(false);
@@ -1603,8 +1750,8 @@ backup_start()
 	}
 
 	if (opt_binlog_info == BINLOG_INFO_ON) {
-
-		lock_binlog_maybe(mysql_connection);
+		lock_binlog_maybe(mysql_connection, opt_backup_lock_timeout,
+				  opt_backup_lock_retry_count);
 		write_binlog_info(mysql_connection);
 	}
 
@@ -1633,9 +1780,9 @@ backup_finish()
 	/* release all locks */
 	if (!opt_no_lock) {
 		unlock_all(mysql_connection);
-		history_lock_time = 0;
-	} else {
 		history_lock_time = time(NULL) - history_lock_time;
+	} else {
+		history_lock_time = 0;
 	}
 
 	/* backup tokudb data files */
@@ -1659,6 +1806,10 @@ backup_finish()
 
 	/* Copy buffer pool dump or LRU dump */
 	if (!opt_rsync) {
+		if (opt_dump_innodb_buffer_pool) {
+			check_dump_innodb_buffer_pool(mysql_connection);
+		}
+
 		if (buffer_pool_filename && file_exists(buffer_pool_filename)) {
 			const char *dst_name;
 
@@ -1702,6 +1853,7 @@ ibx_copy_incremental_over_full()
 				   "xtrabackup_galera_info",
 				   "xtrabackup_slave_info",
 				   "xtrabackup_info",
+				   "xtrabackup_keys",
 				   "ib_lru_dump",
 				   NULL};
 	datadir_iter_t *it = NULL;
@@ -1880,11 +2032,12 @@ bool should_skip_file_on_copy_back(const char *filepath) {
 
 os_thread_ret_t
 copy_back_thread_func(void* data) {
-	bool ret = false;
+	bool ret = true;
 	datadir_thread_ctxt_t* ctx = (datadir_thread_ctxt_t*)data;
-	datadir_node_t node;
+	datadir_node_t node = datadir_node_t();
 
 	if (my_thread_init()) {
+		ret = false;
 		goto cleanup;
 	}
 
@@ -1921,9 +2074,16 @@ copy_back_thread_func(void* data) {
 			continue;
 		}
 
+		file_purpose_t file_purpose;
+		if (ends_with(node.filepath, ".ibd")) {
+			file_purpose = FILE_PURPOSE_DATAFILE;
+		} else {
+			file_purpose = FILE_PURPOSE_OTHER;
+		}
+
 		if (!(ret = copy_or_move_file(node.filepath, node.filepath_rel,
-					      mysql_data_home,
-					      ctx->n_thread))) {
+					      mysql_data_home, ctx->n_thread,
+					      file_purpose))) {
 			goto cleanup;
 		}
 	}
@@ -1941,14 +2101,66 @@ cleanup:
 	OS_THREAD_DUMMY_RETURN;
 }
 
+static
+my_bool
+get_one_option(int optid MY_ATTRIBUTE((unused)),
+	       const struct my_option *opt MY_ATTRIBUTE((unused)),
+	       char *argument MY_ATTRIBUTE((unused)))
+{
+	return 0;
+}
+
+static
 bool
-copy_back()
+load_backup_my_cnf()
+{
+	const char *groups[] = {"mysqld", NULL};
+
+	my_option bakcup_options[] = {
+		{"innodb_checksum_algorithm", 0, "", &srv_checksum_algorithm,
+		&srv_checksum_algorithm, &innodb_checksum_algorithm_typelib,
+		GET_ENUM, REQUIRED_ARG, SRV_CHECKSUM_ALGORITHM_INNODB,
+		0, 0, 0, 0, 0},
+		{0, 0, 0, 0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0}
+	};
+
+	char *exename = (char *) "xtrabackup";
+	char **backup_my_argv = &exename;
+	int backup_my_argc = 1;
+	char fname[FN_REFLEN];
+
+	/* we need full name so that only backup-my.cnf will be read */
+	if (fn_format(fname, "backup-my.cnf", xtrabackup_target_dir, "",
+		      MY_UNPACK_FILENAME | MY_SAFE_PATH) == NULL) {
+		return(false);
+	}
+
+	if (my_load_defaults(fname, groups, &backup_my_argc,
+			     &backup_my_argv, NULL)) {
+		return(false);
+	}
+
+	char **old_argv = backup_my_argv;
+	if (handle_options(&backup_my_argc, &backup_my_argv, bakcup_options,
+			   get_one_option)) {
+		return(false);
+	}
+
+	free_defaults(old_argv);
+
+	return(true);
+}
+
+bool
+copy_back(int argc, char **argv)
 {
 	char *innobase_data_file_path_copy;
 	ulint i;
 	bool ret;
 	datadir_iter_t *it = NULL;
 	char *dst_dir;
+
+	ut_crc32_init();
 
 	if (!opt_force_non_empty_dirs) {
 		if (!directory_exists_and_empty(mysql_data_home,
@@ -1980,6 +2192,65 @@ copy_back()
 		return(false);
 	}
 
+	if (!load_backup_my_cnf()) {
+		msg("xtrabackup: Error: failed to load backup-my.cnf\n");
+		return(false);
+	}
+
+	if (opt_generate_new_master_key && !xb_tablespace_keys_exist()) {
+		msg("xtrabackup: Error: option --generate_new_master_key "
+		    "is specified but xtrabackup_keys is absent.\n");
+		return(false);
+	}
+
+	if (xb_tablespace_keys_exist() && opt_generate_new_master_key) {
+		FILE *f = fopen("xtrabackup_master_key_id", "r");
+		if (f == NULL) {
+			msg("xtrabackup: Error: can't read master_key_id\n");
+			return(false);
+		}
+		fscanf(f, "%lu", &Encryption::master_key_id);
+		fclose(f);
+
+		if (!xb_keyring_init_for_copy_back(argc, argv)) {
+			msg("xtrabackup: Error: failed to init "
+			    "keyring plugin\n");
+			return(false);
+		}
+		if (!xb_tablespace_keys_load(
+		    "./",
+		    opt_transition_key,
+		    opt_transition_key != NULL ?
+		    	strlen(opt_transition_key) : 0)) {
+			msg("xtrabackup: Error: failed to load tablespace "
+			    "keys\n");
+			return(false);
+		}
+
+		byte*	master_key = NULL;
+
+		Encryption::create_master_key(&master_key);
+
+		if (master_key == NULL) {
+			msg("xtrabackup: Error: can't generate new master "
+			    "key. Please check keyring plugin settings.\n");
+			return(false);
+	        }
+
+	        my_free(master_key);
+
+		ulint			master_key_id;
+		Encryption::Version	version;
+		Encryption::get_master_key(&master_key_id,
+					   &master_key,
+					   &version);
+
+		msg_ts("Generated new master key");
+
+	        my_free(master_key);
+
+	}
+
 	/* parse data file path */
 
 	if (!innobase_data_file_path) {
@@ -2000,7 +2271,6 @@ copy_back()
 	srv_page_size = (1 << srv_page_size_shift);
 	srv_max_n_threads = 1000;
 	sync_check_init();
-	// os_io_init_simple();
 	os_thread_init();
 	ut_crc32_init();
 
@@ -2016,7 +2286,7 @@ copy_back()
 			char filename[20];
 			sprintf(filename, "undo%03lu", i);
 			if (!(ret = copy_or_move_file(filename, filename,
-				                      dst_dir, 1))) {
+					dst_dir, 1, FILE_PURPOSE_UNDO_LOG))) {
 				goto cleanup;
 			}
 		}
@@ -2040,8 +2310,8 @@ copy_back()
 			continue;
 		}
 
-		if (!(ret = copy_or_move_file(filename, filename,
-					      dst_dir, 1))) {
+		if (!(ret = copy_or_move_file(filename, filename, dst_dir, 1,
+				FILE_PURPOSE_REDO_LOG))) {
 			goto cleanup;
 		}
 	}
@@ -2063,8 +2333,8 @@ copy_back()
 	     ++iter) {
 		const char *filename = base_name(iter->name());
 
-		if (!(ret = copy_or_move_file(filename, iter->name(),
-					      dst_dir, 1))) {
+		if (!(ret = copy_or_move_file(filename, iter->name(), dst_dir,
+				1, FILE_PURPOSE_DATAFILE))) {
 			goto cleanup;
 		}
 	}
@@ -2106,7 +2376,8 @@ copy_back()
 			!file_exists(innobase_buffer_pool_filename)) {
 			copy_or_move_file(src_name,
 					  innobase_buffer_pool_filename,
-					  mysql_data_home, 0);
+					  mysql_data_home, 0,
+					  FILE_PURPOSE_OTHER);
 		}
 	}
 
@@ -2122,6 +2393,8 @@ cleanup:
 	}
 
 	ds_data = NULL;
+
+	xb_keyring_shutdown();
 
 	os_thread_free();
 	sync_check_close();
@@ -2276,6 +2549,7 @@ decrypt_decompress()
 	return(ret);
 }
 
+#ifdef HAVE_VERSION_CHECK
 void
 version_check()
 {
@@ -2296,6 +2570,7 @@ version_check()
 		snprintf(port, sizeof(port), "%u", opt_port);
 		setenv("option_mysql_port", port, 1);
 	}
+	setenv("XTRABACKUP_VERSION", XTRABACKUP_VERSION, 1);
 
 	FILE *pipe = popen("perl", "w");
 	if (pipe == NULL) {
@@ -2306,3 +2581,4 @@ version_check()
 
 	pclose(pipe);
 }
+#endif

@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2018, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2012, Facebook Inc.
 
 This program is free software; you can redistribute it and/or modify it under
@@ -272,13 +272,14 @@ it is not created by user and so not visible to end-user. */
 #define DICT_TF2_FLAG_UNSET(table, flag)	\
 	(table->flags2 &= ~(flag))
 
+
 /** Tables could be chained together with Foreign key constraint. When
 first load the parent table, we would load all of its descedents.
 This could result in rescursive calls and out of stack error eventually.
 DICT_FK_MAX_RECURSIVE_LOAD defines the maximum number of recursive loads,
 when exceeded, the child table will not be loaded. It will be loaded when
 the foreign constraint check needs to be run. */
-#define DICT_FK_MAX_RECURSIVE_LOAD	20
+#define DICT_FK_MAX_RECURSIVE_LOAD      20
 
 /** Similarly, when tables are chained together with foreign key constraints
 with on cascading delete/update clause, delete from parent table could
@@ -286,7 +287,7 @@ result in recursive cascading calls. This defines the maximum number of
 such cascading deletes/updates allowed. When exceeded, the delete from
 parent table will fail, and user has to drop excessive foreign constraint
 before proceeds. */
-#define FK_MAX_CASCADE_DEL		255
+#define FK_MAX_CASCADE_DEL		15
 
 /**********************************************************************//**
 Creates a table memory object.
@@ -320,7 +321,6 @@ dict_mem_table_add_col(
 	ulint		mtype,	/*!< in: main datatype */
 	ulint		prtype,	/*!< in: precise type */
 	ulint		len);	/*!< in: precision */
-
 /** Adds a virtual column definition to a table.
 @param[in,out]	table		table
 @param[in]	heap		temporary memory heap, or NULL. It is
@@ -345,6 +345,15 @@ dict_mem_table_add_v_col(
 	ulint		len,
 	ulint		pos,
 	ulint		num_base);
+
+/** Adds a stored column definition to a table.
+@param[in]	table		table
+@param[in]	num_base	number of base columns. */
+void
+dict_mem_table_add_s_col(
+	dict_table_t*	table,
+	ulint		num_base);
+
 /**********************************************************************//**
 Renames a column of a table in the data dictionary cache. */
 void
@@ -445,6 +454,27 @@ dict_mem_referenced_table_name_lookup_set(
 /*======================================*/
 	dict_foreign_t*	foreign,	/*!< in/out: foreign struct */
 	ibool		do_alloc);	/*!< in: is an alloc needed */
+
+/** Fills the dependent virtual columns in a set.
+Reason for being dependent are
+1) FK can be present on base column of virtual columns
+2) FK can be present on column which is a part of virtual index
+@param[in,out] foreign foreign key information. */
+void
+dict_mem_foreign_fill_vcol_set(
+       dict_foreign_t*	foreign);
+
+/** Fill virtual columns set in each fk constraint present in the table.
+@param[in,out] table   innodb table object. */
+void
+dict_mem_table_fill_foreign_vcol_set(
+        dict_table_t*	table);
+
+/** Free the vcol_set from all foreign key constraint on the table.
+@param[in,out] table   innodb table object. */
+void
+dict_mem_table_free_foreign_vcol_set(
+	dict_table_t*	table);
 
 /** Create a temporary tablename like "#sql-ibtid-inc where
   tid = the Table ID
@@ -610,6 +640,21 @@ struct dict_add_v_col_t{
 	const char**		v_col_name;
 };
 
+/** Data structure for a stored column in a table. */
+struct dict_s_col_t {
+	/** Stored column ptr */
+	dict_col_t*	m_col;
+	/** array of base col ptr */
+	dict_col_t**	base_col;
+	/** number of base columns */
+	ulint		num_base;
+	/** column pos in table */
+	ulint		s_pos;
+};
+
+/** list to put stored column for create_table_info_t */
+typedef std::list<dict_s_col_t, ut_allocator<dict_s_col_t> >	dict_s_col_list;
+
 /** @brief DICT_ANTELOPE_MAX_INDEX_COL_LEN is measured in bytes and
 is the maximum indexed column length (or indexed prefix length) in
 ROW_FORMAT=REDUNDANT and ROW_FORMAT=COMPACT. Also, in any format,
@@ -643,6 +688,8 @@ be REC_VERSION_56_MAX_INDEX_COL_LEN (3072) bytes */
 
 /** Data structure for a field in an index */
 struct dict_field_t{
+	dict_field_t() { memset(this, 0, sizeof(*this)); }
+
 	dict_col_t*	col;		/*!< pointer to the table column */
 	id_name_t	name;		/*!< name of the column */
 	unsigned	prefix_len:12;	/*!< 0 or the length of the column
@@ -806,10 +853,6 @@ public:
 system clustered index when there is no primary key. */
 const char innobase_index_reserve_name[] = "GEN_CLUST_INDEX";
 
-/* Estimated number of offsets in records (based on columns)
-to start with. */
-#define OFFS_IN_REC_NORMAL_SIZE		100
-
 /** Data structure for an index.  Most fields will be
 initialized to 0, NULL or FALSE in dict_mem_index_create(). */
 struct dict_index_t{
@@ -892,6 +935,8 @@ struct dict_index_t{
 	bool		has_new_v_col;
 				/*!< whether it has a newly added virtual
 				column in ALTER */
+	bool		index_fts_syncing;/*!< Whether the fts index is
+				still syncing in the background */
 #ifndef UNIV_HOTBACKUP
 	UT_LIST_NODE_T(dict_index_t)
 			indexes;/*!< list of indexes of the table */
@@ -996,6 +1041,11 @@ enum online_index_status {
 	ONLINE_INDEX_ABORTED_DROPPED
 };
 
+/** Set to store the virtual columns which are affected by Foreign
+key constraint. */
+typedef std::set<dict_v_col_t*, std::less<dict_v_col_t*>,
+		ut_allocator<dict_v_col_t*> >		dict_vcol_set;
+
 /** Data structure for a foreign key constraint; an example:
 FOREIGN KEY (A, B) REFERENCES TABLE2 (C, D).  Most fields will be
 initialized to 0, NULL or FALSE in dict_mem_foreign_create(). */
@@ -1031,6 +1081,9 @@ struct dict_foreign_t{
 					does not generate new indexes
 					implicitly */
 	dict_index_t*	referenced_index;/*!< referenced index */
+
+	dict_vcol_set*	v_cols;		/*!< set of virtual columns affected
+					by foreign key constraint. */
 };
 
 std::ostream&
@@ -1163,6 +1216,10 @@ dict_foreign_free(
 /*==============*/
 	dict_foreign_t*	foreign)	/*!< in, own: foreign key struct */
 {
+	if (foreign->v_cols != NULL) {
+		UT_DELETE(foreign->v_cols);
+	}
+
 	mem_heap_free(foreign->heap);
 }
 
@@ -1190,8 +1247,8 @@ struct dict_foreign_set_free {
 a foreign key constraint is enforced, therefore RESTRICT just means no flag */
 /* @{ */
 #define DICT_FOREIGN_ON_DELETE_CASCADE	1	/*!< ON DELETE CASCADE */
-#define DICT_FOREIGN_ON_DELETE_SET_NULL	2	/*!< ON UPDATE SET NULL */
-#define DICT_FOREIGN_ON_UPDATE_CASCADE	4	/*!< ON DELETE CASCADE */
+#define DICT_FOREIGN_ON_DELETE_SET_NULL	2	/*!< ON DELETE SET NULL */
+#define DICT_FOREIGN_ON_UPDATE_CASCADE	4	/*!< ON UPDATE CASCADE */
 #define DICT_FOREIGN_ON_UPDATE_SET_NULL	8	/*!< ON UPDATE SET NULL */
 #define DICT_FOREIGN_ON_DELETE_NO_ACTION 16	/*!< ON DELETE NO ACTION */
 #define DICT_FOREIGN_ON_UPDATE_NO_ACTION 32	/*!< ON UPDATE NO ACTION */
@@ -1377,6 +1434,13 @@ struct dict_table_t {
 
 	/** Array of virtual column descriptions. */
 	dict_v_col_t*				v_cols;
+
+	/** List of stored column descriptions. It is used only for foreign key
+	check during create table and copy alter operations.
+	During copy alter, s_cols list is filled during create table operation
+	and need to preserve till rename table operation. That is the
+	reason s_cols is a part of dict_table_t */
+	dict_s_col_list*			s_cols;
 
 	/** Column names packed in a character string
 	"name1\0name2\0...nameN\0". Until the string contains n_cols, it will
@@ -1652,9 +1716,6 @@ public:
 	/** mysql_row_templ_t for base columns used for compute the virtual
 	columns */
 	dict_vcol_templ_t*			vc_templ;
-
-	/** whether above vc_templ comes from purge allocation */
-	bool					vc_templ_purge;
 
 	/** encryption key, it's only for export/import */
 	byte*					encryption_key;

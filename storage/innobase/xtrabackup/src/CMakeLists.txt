@@ -1,4 +1,4 @@
-# Copyright (c) 2013, 2017 Percona LLC and/or its affiliates.
+# Copyright (c) 2013, 2018 Percona LLC and/or its affiliates.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -15,18 +15,18 @@
 
 INCLUDE(gcrypt)
 INCLUDE(curl)
-INCLUDE(libev)
 
-INCLUDE(${MYSQL_CMAKE_SCRIPT_DIR}/compile_flags.cmake)
+OPTION(WITH_VERSION_CHECK "Build with version check" ON)
 
 ADD_SUBDIRECTORY(libarchive)
 ADD_SUBDIRECTORY(crc)
-ADD_SUBDIRECTORY(jsmn)
+ADD_SUBDIRECTORY(xbcloud)
 
+SET(WITH_CURL "system" CACHE STRING "Using system curl by default")
 FIND_GCRYPT()
-FIND_CURL()
-FIND_EV()
+MYSQL_CHECK_CURL()
 
+IF(WITH_VERSION_CHECK)
 # xxd is needed to embed version_check script
 FIND_PROGRAM(XXD_PATH xxd)
 
@@ -34,13 +34,18 @@ IF(NOT XXD_PATH)
   MESSAGE(FATAL_ERROR "xxd not found. Try to install vim-common.")
 ENDIF(NOT XXD_PATH)
 
+SET(HAVE_VERSION_CHECK 1)
+ELSE()
+SET(HAVE_VERSION_CHECK 0)
+ENDIF(WITH_VERSION_CHECK)
+
 INCLUDE_DIRECTORIES(
   ${CMAKE_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/storage/innobase/include
   ${CMAKE_SOURCE_DIR}/sql
+  ${CMAKE_SOURCE_DIR}/storage/innobase/xtrabackup/src
   ${CMAKE_SOURCE_DIR}/storage/innobase/xtrabackup/src/libarchive/libarchive
   ${CMAKE_SOURCE_DIR}/storage/innobase/xtrabackup/src/quicklz
-  ${CMAKE_SOURCE_DIR}/storage/innobase/xtrabackup/src/jsmn
   ${CMAKE_SOURCE_DIR}/storage/innobase/xtrabackup/src/crc
   ${GCRYPT_INCLUDE_DIR}
   ${CURL_INCLUDE_DIRS}
@@ -54,24 +59,18 @@ ADD_DEFINITIONS(${SSL_DEFINES})
 # xtrabackup binary
 ########################################################################
 CONFIGURE_FILE(${CMAKE_CURRENT_SOURCE_DIR}/xtrabackup_version.h.in
-               ${CMAKE_CURRENT_BINARY_DIR}/xtrabackup_version.h )
+               ${CMAKE_CURRENT_BINARY_DIR}/xtrabackup_version.h)
 
-ADD_CUSTOM_COMMAND(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/version_check_pl.h
-                   COMMAND ${XXD_PATH} --include version_check.pl
-                   ${CMAKE_CURRENT_BINARY_DIR}/version_check_pl.h
-                   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+CONFIGURE_FILE(${CMAKE_CURRENT_SOURCE_DIR}/config.h.cmake
+               ${CMAKE_CURRENT_BINARY_DIR}/xtrabackup_config.h)
 
-ADD_CUSTOM_TARGET(GenVersionCheck
-                  DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/version_check_pl.h)
+INCLUDE_DIRECTORIES(
+  ${CMAKE_SOURCE_DIR}/plugin/keyring
+  ${CMAKE_SOURCE_DIR}/plugin/keyring_vault
+  ${BOOST_PATCHES_DIR})
 
-ADD_COMPILE_FLAGS(
-  keyring.cc
-  ../../../../plugin/keyring/keyring_impl.cc
-  ../../../../plugin/keyring/keyring_key.cc
-  ../../../../plugin/keyring/buffered_file_io.cc
-  ../../../../plugin/keyring/keys_container.cc
-  COMPILE_FLAGS -I${BOOST_PATCHES_DIR} -isystem ${BOOST_INCLUDE_DIR}
-)
+ADD_SUBDIRECTORY(${CMAKE_SOURCE_DIR}/plugin/keyring "${CMAKE_CURRENT_BINARY_DIR}/keyring")
+ADD_SUBDIRECTORY(${CMAKE_SOURCE_DIR}/plugin/keyring_vault "${CMAKE_CURRENT_BINARY_DIR}/keyring_vault")
 
 ADD_COMPILE_FLAGS(
   xtrabackup.cc
@@ -103,25 +102,33 @@ MYSQL_ADD_EXECUTABLE(xtrabackup
   xbstream_write.c
   backup_mysql.cc
   backup_copy.cc
-  keyring.cc
-  ../../../../plugin/keyring/keyring_impl.cc
-  ../../../../plugin/keyring/keyring_key.cc
-  ../../../../plugin/keyring/buffered_file_io.cc
-  ../../../../plugin/keyring/keys_container.cc
-  ../../../../sql-common/client_authentication.cc
-  ../../../../sql/des_key_file.cc
+  keyring_plugins.cc
+  kdf.cc
+  ${CMAKE_SOURCE_DIR}/sql-common/client_authentication.cc
+  ${CMAKE_SOURCE_DIR}/sql/des_key_file.cc
+  ${CMAKE_SOURCE_DIR}/sql/auth/sha2_password_common.cc
   )
 
 SET_TARGET_PROPERTIES(xtrabackup PROPERTIES ENABLE_EXPORTS TRUE)
 
-TARGET_LINK_LIBRARIES(xtrabackup 
-  mysqlserver 
-  ${GCRYPT_LIBS} 
+TARGET_LINK_LIBRARIES(xtrabackup
+  mysqlserver
+  ${GCRYPT_LIBS}
   archive_static
   crc
   )
 
+IF(WITH_VERSION_CHECK)
+ADD_CUSTOM_COMMAND(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/version_check_pl.h
+                   COMMAND ${XXD_PATH} --include version_check.pl
+                   ${CMAKE_CURRENT_BINARY_DIR}/version_check_pl.h
+                   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+ADD_CUSTOM_TARGET(GenVersionCheck
+                  DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/version_check_pl.h)
+
 ADD_DEPENDENCIES(xtrabackup GenVersionCheck)
+ENDIF(WITH_VERSION_CHECK)
 
 ########################################################################
 # innobackupex symlink
@@ -182,29 +189,4 @@ TARGET_LINK_LIBRARIES(xbcrypt
   mysys
   mysys_ssl
   crc
-  )
-
-########################################################################
-# xbcloud binary
-########################################################################
-MY_CHECK_C_COMPILER_FLAG("-Werror=format-truncation=0" HAVE_WFORMAT_TRUNCATION)
-IF(HAVE_WFORMAT_TRUNCATION)
-  SET(WARNING_FLAGS "-Werror=format-truncation=0")
-ENDIF()
-MYSQL_ADD_EXECUTABLE(xbcloud
-  xbcloud.cc
-  )
-
-SET_TARGET_PROPERTIES(xbcloud
-        PROPERTIES LINKER_LANGUAGE CXX
-        COMPILE_FLAGS "${WARNING_FLAGS}"
-        )
-
-TARGET_LINK_LIBRARIES(xbcloud
-  ${GCRYPT_LIBS}
-  ${LIBEV_LIBRARIES}
-  ${CURL_LIBRARIES}
-  mysys
-  mysys_ssl
-  jsmn
   )

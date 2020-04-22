@@ -42,6 +42,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <my_global.h>
 #include <mysql.h>
 #include <my_sys.h>
+#include <sql_plugin.h>
 #include <ha_prototypes.h>
 #include <srv0srv.h>
 #include <string.h>
@@ -101,6 +102,13 @@ static bool binlog_locked;
 /* Whether LOCK TABLES FOR BACKUP / FLUSH TABLES WITH READ LOCK has been issued
 during backup */
 static bool tables_locked;
+
+/* buffer pool dump */
+ssize_t innodb_buffer_pool_dump_start_time;
+static int original_innodb_buffer_pool_dump_pct;
+static bool innodb_buffer_pool_dump;
+static bool innodb_buffer_pool_dump_pct;
+
 
 extern "C" {
 MYSQL * STDCALL
@@ -175,6 +183,12 @@ xb_mysql_connect()
 	xb_mysql_query(connection, "SET SESSION wait_timeout=2147483",
 		       false, true);
 
+	xb_mysql_query(connection, "SET SESSION autocommit=1",
+		       false, true);
+
+	xb_mysql_query(connection, "SET NAMES utf8",
+		       false, true);
+
 	return(connection);
 }
 
@@ -187,8 +201,10 @@ xb_mysql_query(MYSQL *connection, const char *query, bool use_result,
 	MYSQL_RES *mysql_result = NULL;
 
 	if (mysql_query(connection, query)) {
-		msg("Error: failed to execute query %s: %s\n", query,
-			mysql_error(connection));
+		msg("Error: failed to execute query '%s': %u (%s) %s\n", query,
+		    mysql_errno(connection),
+		    mysql_errno_to_sqlstate(mysql_errno(connection)),
+		    mysql_error(connection));
 		if (die_on_error) {
 			exit(EXIT_FAILURE);
 		}
@@ -199,7 +215,7 @@ xb_mysql_query(MYSQL *connection, const char *query, bool use_result,
 	if (mysql_field_count(connection) > 0) {
 		if ((mysql_result = mysql_store_result(connection)) == NULL) {
 			msg("Error: failed to fetch query result %s: %s\n",
-				query, mysql_error(connection));
+			    query, mysql_error(connection));
 			exit(EXIT_FAILURE);
 		}
 
@@ -302,7 +318,6 @@ free_mysql_variables(mysql_variable *vars)
 	}
 }
 
-static
 char *
 read_mysql_one_value(MYSQL *connection, const char *query)
 {
@@ -397,10 +412,15 @@ check_server_version(unsigned long version_number,
 		    "supported in this release. You can either use "
 		    "Percona XtraBackup 2.0, or upgrade to InnoDB "
 		    "plugin.\n");
+	} else if (version_number > 80000 && version_number < 90000) {
+		msg("Error: MySQL 8.0 and Percona Server 8.0 are not "
+		    "supported by Percona Xtrabackup 2.4.x series. "
+		    "Please use Percona Xtrabackup 8.0.x for backups "
+		    "and restores.\n");
 	} else if (!version_supported) {
 		msg("Error: Unsupported server version: '%s'. Please "
 		    "report a bug at "
-		    "https://bugs.launchpad.net/percona-xtrabackup\n",
+		    "https://jira.percona.com/projects/PXB\n",
 		    version_string);
 	}
 
@@ -437,6 +457,8 @@ get_mysql_vars(MYSQL *connection)
 	char *innodb_log_checksum_algorithm_var = NULL;
 	char *tokudb_checkpoint_lock_var = NULL;
 	char *innodb_checksum_algorithm_var = NULL;
+	char *innodb_track_changed_pages_var = NULL;
+	char *server_uuid_var = NULL;
 
 	unsigned long server_version = mysql_get_server_version(connection);
 
@@ -470,6 +492,8 @@ get_mysql_vars(MYSQL *connection)
 			&innodb_log_checksum_algorithm_var},
 		{"tokudb_checkpoint_lock", &tokudb_checkpoint_lock_var},
 		{"innodb_checksum_algorithm", &innodb_checksum_algorithm_var},
+		{"innodb_track_changed_pages", &innodb_track_changed_pages_var},
+		{"server_uuid", &server_uuid_var},
 		{NULL, NULL}
 	};
 
@@ -655,6 +679,15 @@ get_mysql_vars(MYSQL *connection)
 	/* TokuDB plugin check via tokudb_checkpoint_lock */
 	if (tokudb_checkpoint_lock_var != NULL) {
 		have_tokudb = true;
+	memset(server_uuid, 0, ENCRYPTION_SERVER_UUID_LEN + 1);
+	if (server_uuid_var != NULL) {
+		strncpy(server_uuid, server_uuid_var,
+			ENCRYPTION_SERVER_UUID_LEN);
+	}
+
+	if (innodb_track_changed_pages_var != NULL &&
+	    strcasecmp(innodb_track_changed_pages_var, "ON") == 0) {
+	  have_changed_page_bitmaps = true;
 	}
 
 out:
@@ -669,21 +702,7 @@ Query the server to find out what backup capabilities it supports.
 bool
 detect_mysql_capabilities_for_backup()
 {
-	const char *query = "SELECT 'INNODB_CHANGED_PAGES', COUNT(*) FROM "
-				"INFORMATION_SCHEMA.PLUGINS "
-			    "WHERE PLUGIN_NAME LIKE 'INNODB_CHANGED_PAGES'";
-	char *innodb_changed_pages = NULL;
-	mysql_variable vars[] = {
-		{"INNODB_CHANGED_PAGES", &innodb_changed_pages}, {NULL, NULL}};
-
 	if (xtrabackup_incremental) {
-
-		read_mysql_variables(mysql_connection, query, vars, true);
-
-		ut_ad(innodb_changed_pages != NULL);
-
-		have_changed_page_bitmaps = (atoi(innodb_changed_pages) == 1);
-
 		/* INNODB_CHANGED_PAGES are listed in
 		INFORMATION_SCHEMA.PLUGINS in MariaDB, but
 		FLUSH NO_WRITE_TO_BINLOG CHANGED_PAGE_BITMAPS
@@ -693,8 +712,6 @@ detect_mysql_capabilities_for_backup()
 		    mysql_server_version < 100106) {
 			have_changed_page_bitmaps = false;
 		}
-
-		free_mysql_variables(vars);
 	}
 
 	/* do some sanity checks */
@@ -706,9 +723,10 @@ detect_mysql_capabilities_for_backup()
 	}
 
 	if (opt_slave_info && have_multi_threaded_slave &&
-	    !have_gtid_slave) {
-	    	msg("The --slave-info option requires GTID enabled for a "
-			"multi-threaded slave.\n");
+	    !have_gtid_slave && !opt_safe_slave_backup) {
+		msg("The --slave-info option requires GTID enabled or "
+			"--safe-slave-backup option used for a multi-threaded "
+			"slave.\n");
 		return(false);
 	}
 
@@ -880,9 +898,12 @@ have_queries_to_wait_for(MYSQL *connection, uint threshold)
 		    	|| is_update_query(info))) {
 			msg_ts("Waiting for query %s (duration %d sec): %s",
 			       id, duration, info);
+			mysql_free_result(result);
 			return(true);
 		}
 	}
+
+	mysql_free_result(result);
 
 	return(false);
 }
@@ -915,6 +936,8 @@ kill_long_queries(MYSQL *connection, uint timeout)
 			xb_mysql_query(connection, kill_stmt, false, false);
 		}
 	}
+
+	mysql_free_result(result);
 }
 
 static
@@ -949,6 +972,8 @@ kill_query_thread(
 	MYSQL	*mysql;
 	time_t	start_time;
 
+	my_thread_init();
+
 	start_time = time(NULL);
 
 	os_event_set(kill_query_thread_started);
@@ -981,6 +1006,8 @@ kill_query_thread(
 
 stop_thread:
 	msg_ts("Kill query thread stopped\n");
+
+	my_thread_end();
 
 	os_event_set(kill_query_thread_stopped);
 
@@ -1016,7 +1043,7 @@ Function acquires a backup tables lock if supported by the server.
 Allows to specify timeout in seconds for attempts to acquire the lock.
 @returns true if lock acquired */
 bool
-lock_tables_for_backup(MYSQL *connection, int timeout)
+lock_tables_for_backup(MYSQL *connection, int timeout, int retry_count)
 {
 	if (have_lock_wait_timeout) {
 		char query[200];
@@ -1028,9 +1055,23 @@ lock_tables_for_backup(MYSQL *connection, int timeout)
 	}
 
 	if (have_backup_locks) {
-		msg_ts("Executing LOCK TABLES FOR BACKUP...\n");
-		xb_mysql_query(connection, "LOCK TABLES FOR BACKUP", true);
-		tables_locked = true;
+		for (int i = 0; i <= retry_count; ++i) {
+			msg_ts("Executing LOCK TABLES FOR BACKUP...\n");
+			xb_mysql_query(connection, "LOCK TABLES FOR BACKUP",
+				       false, false);
+			uint err = mysql_errno(connection);
+			if (err == ER_LOCK_WAIT_TIMEOUT) {
+				os_thread_sleep(1000000);
+				continue;
+			}
+			if (err == 0) {
+				tables_locked = true;
+			}
+			break;
+		}
+		if (!tables_locked) {
+			exit(EXIT_FAILURE);
+		}
 		return(true);
 	}
 
@@ -1045,22 +1086,23 @@ by the server, or a global read lock (FLUSH TABLES WITH READ LOCK)
 otherwise.
 @returns true if lock acquired */
 bool
-lock_tables_maybe(MYSQL *connection)
+lock_tables_maybe(MYSQL *connection, int timeout, int retry_count)
 {
 	if (tables_locked || opt_lock_ddl_per_table) {
 		return(true);
 	}
 
 	if (have_backup_locks) {
-		return lock_tables_for_backup(connection);
+		return lock_tables_for_backup(connection, timeout, retry_count);
 	}
 
 	if (have_lock_wait_timeout) {
-		/* Set the maximum supported session value for
-		lock_wait_timeout to prevent unnecessary timeouts when the
-		global value is changed from the default */
-		xb_mysql_query(connection,
-			"SET SESSION lock_wait_timeout=31536000", false);
+		char query[200];
+
+		ut_snprintf(query, sizeof(query),
+			    "SET SESSION lock_wait_timeout=%d", timeout);
+
+		xb_mysql_query(connection, query, false);
 	}
 
 	if (!opt_lock_wait_timeout && !opt_kill_long_queries_timeout) {
@@ -1118,12 +1160,34 @@ If backup locks are used, execute LOCK BINLOG FOR BACKUP provided that we are
 not in the --no-lock mode and the lock has not been acquired already.
 @returns true if lock acquired */
 bool
-lock_binlog_maybe(MYSQL *connection)
+lock_binlog_maybe(MYSQL *connection, int timeout, int retry_count)
 {
 	if (have_backup_locks && !opt_no_lock && !binlog_locked) {
-		msg_ts("Executing LOCK BINLOG FOR BACKUP...\n");
-		xb_mysql_query(connection, "LOCK BINLOG FOR BACKUP", false);
-		binlog_locked = true;
+		if (have_lock_wait_timeout) {
+			char query[200];
+
+			ut_snprintf(query, sizeof(query),
+				    "SET SESSION lock_wait_timeout=%d",
+				    timeout);
+		}
+
+		for (int i = 0; i <= retry_count; ++i) {
+			msg_ts("Executing LOCK BINLOG FOR BACKUP...\n");
+			xb_mysql_query(connection, "LOCK BINLOG FOR BACKUP",
+				       false, false);
+			uint err = mysql_errno(connection);
+			if (err == ER_LOCK_WAIT_TIMEOUT) {
+				os_thread_sleep(1000000);
+				continue;
+			}
+			if (err == 0) {
+				binlog_locked = true;
+			}
+			break;
+		}
+		if (!binlog_locked) {
+			exit(EXIT_FAILURE);
+		}
 
 		return(true);
 	}
@@ -1343,6 +1407,7 @@ write_slave_info(MYSQL *connection)
 	char *gtid_slave_pos = NULL;
 	char *auto_position = NULL;
 	char *using_gtid = NULL;
+	char *slave_sql_running = NULL;
 
 	char *ptr = NULL;
 	char *writable_channel_name = NULL;
@@ -1360,6 +1425,7 @@ write_slave_info(MYSQL *connection)
 		{"Channel_Name", &writable_channel_name},
 		{"Auto_Position", &auto_position},
 		{"Using_Gtid", &using_gtid},
+		{"Slave_SQL_Running", &slave_sql_running},
 		{NULL, NULL}
 	};
 
@@ -1395,6 +1461,9 @@ write_slave_info(MYSQL *connection)
 		} else {
 			channel_name = channel_info = "";
 		}
+
+		ut_ad(!have_multi_threaded_slave || have_gtid_slave ||
+			strcasecmp(slave_sql_running, "No") == 0);
 
 		if (slave_info.capacity() == 0) {
 			slave_info.reserve(4096);
@@ -1552,7 +1621,8 @@ write_current_binlog_file(MYSQL *connection)
 	if (gtid_exists) {
 		size_t log_bin_dir_length;
 
-		lock_binlog_maybe(connection);
+		lock_binlog_maybe(connection, opt_backup_lock_timeout,
+				  opt_backup_lock_retry_count);
 
 		xb_mysql_query(connection, "FLUSH BINARY LOGS", false);
 
@@ -1964,42 +2034,49 @@ cleanup:
 bool
 write_backup_config_file()
 {
-	return backup_file_printf("backup-my.cnf",
-		"# This MySQL options file was generated by innobackupex.\n\n"
-		"# The MySQL server\n"
-		"[mysqld]\n"
-		"innodb_checksum_algorithm=%s\n"
-		"innodb_log_checksum_algorithm=%s\n"
-		"innodb_data_file_path=%s\n"
-		"innodb_log_files_in_group=%lu\n"
-		"innodb_log_file_size=%lld\n"
-		"innodb_fast_checksum=%s\n"
-		"innodb_page_size=%lu\n"
-		"innodb_log_block_size=%lu\n"
-		"innodb_undo_directory=%s\n"
-		"innodb_undo_tablespaces=%lu\n"
-		"server_id=%lu\n"
-		"%s%s\n"
-		"redo_log_version=%lu\n"
-		"%s%s\n",
-		innodb_checksum_algorithm_names[srv_checksum_algorithm],
-		innodb_checksum_algorithm_names[srv_log_checksum_algorithm],
-		innobase_data_file_path,
-		srv_n_log_files,
-		innobase_log_file_size,
-		srv_fast_checksum ? "true" : "false",
-		srv_page_size,
-		srv_log_block_size,
-		srv_undo_dir,
-		srv_undo_tablespaces,
-		(ulint)server_id,
-		innobase_doublewrite_file ? "innodb_doublewrite_file=" : "",
-		innobase_doublewrite_file ? innobase_doublewrite_file : "",
-		redo_log_version,
-		innobase_buffer_pool_filename ?
-			"innodb_buffer_pool_filename=" : "",
-		innobase_buffer_pool_filename ?
-			innobase_buffer_pool_filename : "");
+	std::ostringstream s;
+
+	s << "# This MySQL options file was generated by innobackupex.\n\n"
+	  << "# The MySQL server\n"
+	  << "[mysqld]\n"
+	  << "innodb_checksum_algorithm="
+	  << innodb_checksum_algorithm_names[srv_checksum_algorithm] << "\n"
+	  << "innodb_log_checksum_algorithm="
+	  << innodb_checksum_algorithm_names[srv_log_checksum_algorithm] << "\n"
+	  << "innodb_data_file_path=" << innobase_data_file_path << "\n"
+	  << "innodb_log_files_in_group=" << srv_n_log_files << "\n"
+	  << "innodb_log_file_size=" << innobase_log_file_size << "\n"
+	  << "innodb_fast_checksum="
+	  << (srv_fast_checksum ? "true" : "false") << "\n"
+	  << "innodb_page_size=" << srv_page_size << "\n"
+	  << "innodb_log_block_size=" << srv_log_block_size << "\n"
+	  << "innodb_undo_directory=" << srv_undo_dir << "\n"
+	  << "innodb_undo_tablespaces=" << srv_undo_tablespaces << "\n"
+	  << "server_id=" << server_id << "\n"
+	  << "redo_log_version=" << redo_log_version << "\n";
+
+	if (innobase_doublewrite_file) {
+		s << "innodb_doublewrite_file="
+		  << innobase_doublewrite_file << "\n";
+	}
+
+	if (innobase_buffer_pool_filename) {
+		s << "innodb_buffer_pool_filename="
+		  << innobase_buffer_pool_filename << "\n";
+	}
+
+	I_List_iterator<i_string> iter(*opt_plugin_load_list_ptr);
+	i_string *item;
+	while ((item = iter++) != NULL) {
+		s << "plugin_load=" << item->ptr << "\n";
+	}
+
+	if (server_uuid[0] != 0) {
+		s << "server_uuid=" << server_uuid << "\n";
+	}
+	s << "master_key_id=" << Encryption::master_key_id << "\n";
+
+	return backup_file_print("backup-my.cnf", s.str().c_str(), s.tellp());
 }
 
 
@@ -2024,6 +2101,14 @@ char *make_argv(char *buf, size_t len, int argc, char **argv)
 		if (strncmp(*argv, "--encrypt_key",
 				strlen("--encrypt_key")) == 0) {
 			arg = "--encrypt_key=...";
+		}
+		if (strncmp(*argv, "--transition-key",
+				strlen("--transition-key")) == 0) {
+			arg = "--transition-key=...";
+		}
+		if (strncmp(*argv, "--transition_key",
+				strlen("--transition_key")) == 0) {
+			arg = "--transition_key=...";
 		}
 		left-= ut_snprintf(buf + len - left, left,
 			"%s%c", arg, argc > 1 ? ' ' : 0);
@@ -2113,18 +2198,13 @@ mdl_lock_table(ulint space_id)
 		"SELECT NAME FROM INFORMATION_SCHEMA.INNODB_SYS_TABLES "
 		"WHERE SPACE = %lu", space_id));
 
-	xb_mysql_query(mdl_con, query, true, true);
-
 	mysql_result = xb_mysql_query(mdl_con, query, true);
 
 	while ((row = mysql_fetch_row(mysql_result))) {
-		char *table_name = strdup(row[0]);
-		char *separator = strchr(table_name, '/');
 		char *lock_query;
+		char table_name[MAX_FULL_NAME_LEN + 1];
 
-		if (separator != NULL) {
-			*separator = '.';
-		}
+		innobase_format_name(table_name, sizeof(table_name), row[0]);
 
 		msg_ts("Locking MDL for %s\n", table_name);
 
@@ -2135,7 +2215,6 @@ mdl_lock_table(ulint space_id)
 		xb_mysql_query(mdl_con, lock_query, false, false);
 
 		free(lock_query);
-		free(table_name);
 	}
 
 	mysql_free_result(mysql_result);
@@ -2155,3 +2234,139 @@ mdl_unlock_all()
 	mutex_free(&mdl_lock_con_mutex);
 }
 
+bool
+has_innodb_buffer_pool_dump()
+{
+	if ((server_flavor == FLAVOR_PERCONA_SERVER ||
+		server_flavor == FLAVOR_MYSQL) &&
+		mysql_server_version >= 50603) {
+		return(true);
+	}
+
+	if (server_flavor == FLAVOR_MARIADB && mysql_server_version >= 10000) {
+		return(true);
+	}
+
+	msg_ts("Server has no support for innodb_buffer_pool_dump_now");
+	return(false);
+}
+
+bool
+has_innodb_buffer_pool_dump_pct()
+{
+	if ((server_flavor == FLAVOR_PERCONA_SERVER ||
+		server_flavor == FLAVOR_MYSQL) &&
+		mysql_server_version >= 50702) {
+		return(true);
+	}
+
+	if (server_flavor == FLAVOR_MARIADB && mysql_server_version >= 10110) {
+		return(true);
+	}
+
+	return(false);
+}
+
+void
+dump_innodb_buffer_pool(MYSQL *connection)
+{
+	innodb_buffer_pool_dump = has_innodb_buffer_pool_dump();
+	innodb_buffer_pool_dump_pct = has_innodb_buffer_pool_dump_pct();
+	if (!innodb_buffer_pool_dump) {
+		return;
+	}
+
+	innodb_buffer_pool_dump_start_time = (ssize_t)my_time(MY_WME);
+
+	char *buf_innodb_buffer_pool_dump_pct;
+	char change_bp_dump_pct_query[100];
+
+	/* Verify if we need to change innodb_buffer_pool_dump_pct */
+	if (opt_dump_innodb_buffer_pool_pct != 0 &&
+		innodb_buffer_pool_dump_pct) {
+			mysql_variable variables[] = {
+				{"innodb_buffer_pool_dump_pct",
+				&buf_innodb_buffer_pool_dump_pct},
+				{NULL, NULL}
+			};
+			read_mysql_variables(connection,
+				"SHOW GLOBAL VARIABLES "
+				"LIKE 'innodb_buffer_pool_dump_pct'",
+				variables, true);
+
+			original_innodb_buffer_pool_dump_pct =
+					atoi(buf_innodb_buffer_pool_dump_pct);
+
+			free_mysql_variables(variables);
+			ut_snprintf(change_bp_dump_pct_query,
+				sizeof(change_bp_dump_pct_query),
+				"SET GLOBAL innodb_buffer_pool_dump_pct = %u",
+				opt_dump_innodb_buffer_pool_pct);
+			msg_ts("Executing %s \n", change_bp_dump_pct_query);
+			xb_mysql_query(mysql_connection,
+				change_bp_dump_pct_query, false);
+	}
+
+	msg_ts("Executing SET GLOBAL innodb_buffer_pool_dump_now=ON...\n");
+	xb_mysql_query(mysql_connection,
+		"SET GLOBAL innodb_buffer_pool_dump_now=ON;", false);
+}
+
+void
+check_dump_innodb_buffer_pool(MYSQL *connection)
+{
+	if (!innodb_buffer_pool_dump) {
+		return;
+	}
+	const ssize_t timeout = opt_dump_innodb_buffer_pool_timeout;
+
+	char *innodb_buffer_pool_dump_status;
+	char change_bp_dump_pct_query[100];
+
+
+	mysql_variable status[] = {
+			{"Innodb_buffer_pool_dump_status",
+			&innodb_buffer_pool_dump_status},
+			{NULL, NULL}
+	};
+
+	read_mysql_variables(connection,
+		"SHOW STATUS LIKE "
+		"'Innodb_buffer_pool_dump_status'",
+		status, true);
+
+	/* check if dump has been completed */
+	msg_ts("Checking if InnoDB buffer pool dump has completed\n");
+	while (!strstr(innodb_buffer_pool_dump_status,
+					"dump completed at")) {
+		if (innodb_buffer_pool_dump_start_time +
+				timeout < (ssize_t)my_time(MY_WME)){
+			msg_ts("InnoDB Buffer Pool Dump was not completed "
+				"after %d seconds... Adjust "
+				"--dump-innodb-buffer-pool-timeout if you "
+				"need higher wait time before copying %s.\n",
+				opt_dump_innodb_buffer_pool_timeout,
+				buffer_pool_filename);
+			break;
+		}
+
+		read_mysql_variables(connection,
+			"SHOW STATUS LIKE 'Innodb_buffer_pool_dump_status'",
+			status, true);
+
+		os_thread_sleep(1000000);
+	}
+
+	free_mysql_variables(status);
+
+	/* restore original innodb_buffer_pool_dump_pct */
+	if (opt_dump_innodb_buffer_pool_pct != 0 &&
+			innodb_buffer_pool_dump_pct) {
+		ut_snprintf(change_bp_dump_pct_query,
+			sizeof(change_bp_dump_pct_query),
+			"SET GLOBAL innodb_buffer_pool_dump_pct = %u",
+			original_innodb_buffer_pool_dump_pct);
+		xb_mysql_query(mysql_connection,
+			change_bp_dump_pct_query, false);
+	}
+}

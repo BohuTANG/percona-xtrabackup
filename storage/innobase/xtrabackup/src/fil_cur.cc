@@ -147,6 +147,7 @@ xb_fil_cur_open(
 	cursor->node = NULL;
 
 	cursor->space_id = node->space->id;
+	cursor->space_flags = node->space->flags;
 	cursor->is_system = !fil_is_user_tablespace_id(node->space->id);
 
 	strncpy(cursor->abs_path, node->name, sizeof(cursor->abs_path));
@@ -200,8 +201,9 @@ xb_fil_cur_open(
 
 	cursor->node = node;
 	cursor->file = node->handle;
+	cursor->block_size = node->block_size;
 
-	if (my_fstat(cursor->file, &cursor->statinfo, MYF(MY_WME))) {
+	if (my_fstat(cursor->file.m_file, &cursor->statinfo, MYF(MY_WME))) {
 		msg("[%02u] xtrabackup: error: cannot stat %s\n",
 		    thread_n, cursor->abs_path);
 
@@ -213,10 +215,10 @@ xb_fil_cur_open(
 	if (srv_unix_file_flush_method == SRV_UNIX_O_DIRECT
 	    || srv_unix_file_flush_method == SRV_UNIX_O_DIRECT_NO_FSYNC) {
 
-		os_file_set_nocache(cursor->file, node->name, "OPEN");
+		os_file_set_nocache(cursor->file.m_file, node->name, "OPEN");
 	}
 
-	posix_fadvise(cursor->file, 0, 0, POSIX_FADV_SEQUENTIAL);
+	posix_fadvise(cursor->file.m_file, 0, 0, POSIX_FADV_SEQUENTIAL);
 
 	/* Determine the page size */
 	page_size.copy_from(xb_get_zip_size(cursor->file, &success));
@@ -260,7 +262,7 @@ xb_fil_cur_open(
 				  node->space->id);
 
 	cursor->scratch = static_cast<byte *>
-		(ut_malloc_nokey(cursor->page_size));
+		(ut_malloc_nokey(cursor->page_size * 2));
 	cursor->decrypt = static_cast<byte *>
 		(ut_malloc_nokey(cursor->page_size));
 
@@ -284,24 +286,27 @@ xb_fil_cur_read(
 /*============*/
 	xb_fil_cur_t*	cursor)	/*!< in/out: source file cursor */
 {
-	ibool			success;
-	byte*			page;
+	dberr_t			err;
+	byte*			page, *page_to_check;
 	ulint			i;
 	ulint			npages;
 	ulint			retry_count;
 	xb_fil_cur_result_t	ret;
 	ib_uint64_t		offset;
 	ib_uint64_t		to_read;
+	ulong			n_read;
 	page_size_t		page_size(cursor->zip_size != 0 ?
 					  cursor->zip_size : cursor->page_size,
 					  cursor->page_size,
 					  cursor->zip_size != 0);
-	IORequest		read_request(IORequest::READ);
+	IORequest		read_request(IORequest::READ |
+					     IORequest::NO_COMPRESSION);
 
 	read_request.encryption_algorithm(Encryption::AES);
 	read_request.encryption_key(cursor->encryption_key,
 				    cursor->encryption_klen,
 				    cursor->encryption_iv);
+	read_request.block_size(cursor->block_size);
 
 	cursor->read_filter->get_next_batch(&cursor->read_filter_ctxt,
 					    &offset, &to_read);
@@ -337,8 +342,6 @@ xb_fil_cur_read(
 
 	xb_a(to_read % cursor->page_size == 0);
 
-	npages = (ulint) (to_read >> cursor->page_size_shift);
-
 	retry_count = 10;
 	ret = XB_FIL_CUR_SUCCESS;
 
@@ -350,21 +353,41 @@ read_retry:
 	cursor->buf_offset = offset;
 	cursor->buf_page_no = (ulint) (offset >> cursor->page_size_shift);
 
-	success = os_file_read(read_request, cursor->file, cursor->buf, offset,
-			       to_read);
-	if (!success) {
-		return(XB_FIL_CUR_ERROR);
+	err = os_file_read_no_error_handling(read_request, cursor->file,
+		cursor->buf, offset, to_read, &n_read);
+	if (err != DB_SUCCESS) {
+		if (err == DB_IO_ERROR) {
+			/* If the file is truncated by MySQL, os_file_read will
+			fail with DB_IO_ERROR, but XtraBackup must treat this
+			error as non critical. */
+			if (my_fstat(cursor->file.m_file, &cursor->statinfo,
+				     MYF(MY_WME))) {
+				msg("[%02u] xtrabackup: error: cannot stat "
+				    "%s\n", cursor->thread_n, cursor->abs_path);
+				return(XB_FIL_CUR_ERROR);
+			}
+			/* Check if we reached EOF */
+			if ((ulonglong) cursor->statinfo.st_size >
+			    offset + n_read) {
+				return(XB_FIL_CUR_ERROR);
+			}
+		}
 	}
+
+	npages = n_read >> cursor->page_size_shift;
 
 	/* check pages for corruption and re-read if necessary. i.e. in case of
 	partially written pages */
 	for (page = cursor->buf, i = 0; i < npages;
 	     page += cursor->page_size, i++) {
+		page_to_check = page;
 
 		if (Encryption::is_encrypted_page(page)) {
 			dberr_t		ret;
-			Encryption	encryption(read_request.encryption_algorithm());
+			Encryption	encryption(
+				read_request.encryption_algorithm());
 
+			page_to_check = cursor->decrypt;
 			memcpy(cursor->decrypt, page, cursor->page_size);
 			ret = encryption.decrypt(read_request, cursor->decrypt,
 						 cursor->page_size,
@@ -381,25 +404,21 @@ read_retry:
 					goto corruption;
 				}
 			}
-
-			if (buf_page_is_corrupted(TRUE, cursor->decrypt,
-						  page_size, false)) {
-				goto corruption;
-			}
-
 		}
 
 		if (Compression::is_compressed_page(page)) {
 
-			if (os_file_decompress_page(false, page,
+			page_to_check = cursor->decrypt;
+			memcpy(cursor->decrypt, page, cursor->page_size);
+			if (os_file_decompress_page(false, cursor->decrypt,
 			    cursor->scratch, cursor->page_size) != DB_SUCCESS) {
 				goto corruption;
 			}
 
 		}
 
-		if (!Encryption::is_encrypted_page(page) &&
-		    buf_page_is_corrupted(TRUE, page, page_size, false)) {
+		if (buf_page_is_corrupted(TRUE, page_to_check, page_size,
+					  false)) {
 
 corruption:
 
@@ -438,7 +457,9 @@ corruption:
 		cursor->buf_npages++;
 	}
 
-	posix_fadvise(cursor->file, offset, to_read, POSIX_FADV_DONTNEED);
+	cursor->read_filter->update(&cursor->read_filter_ctxt, n_read, cursor);
+
+	posix_fadvise(cursor->file.m_file, offset, to_read, POSIX_FADV_DONTNEED);
 
 	return(ret);
 }

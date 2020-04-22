@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2016, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -24,6 +24,7 @@
 #include "sql_string.h"
 
 #include <algorithm>
+#include <limits>
 
 using std::min;
 using std::max;
@@ -88,7 +89,8 @@ bool String::real_alloc(size_t length)
    new buffer is smaller than the currently allocated buffer (if one exists),
    no allocation occured.
 
-   @retval true An error occured when attempting to allocate memory.
+   @retval true An error occured when attempting to allocate memory or memory
+   allocation length exceeded allowed limit (4GB) for String Class.
 */
 bool String::mem_realloc(size_t alloc_length, bool force_on_heap)
 {
@@ -106,9 +108,13 @@ bool String::mem_realloc(size_t alloc_length, bool force_on_heap)
     m_alloced_length= 0;
   }
 
-  if (m_alloced_length < len)
+  if (m_alloced_length < len)     // Available bytes are not enough
   {
-    // Available bytes are not enough.
+    // Signal an error if len exceeds uint32 max on 64-bit word platform.
+#if defined(__WORDSIZE) && (__WORDSIZE == 64)
+    if (len > std::numeric_limits<uint32>::max())
+      return true;
+#endif
     char *new_ptr;
     if (m_is_alloced)
     {
@@ -131,6 +137,42 @@ bool String::mem_realloc(size_t alloc_length, bool force_on_heap)
     m_alloced_length= static_cast<uint32>(len);
   }
   m_ptr[alloc_length]= 0;			// This make other funcs shorter
+  return false;
+}
+
+/*
+  Helper function for @see mem_realloc_exp.
+ */
+inline size_t String::next_realloc_exp_size(size_t sz)
+{
+  const size_t len= ALIGN_SIZE(sz + 1);
+  const size_t ret=
+    (m_is_alloced && m_alloced_length < len) ? sz + (m_length / 4) : sz;
+  return ret;
+}
+
+/**
+  This function is used by the various append() member functions, to ensure
+  that append() has amortized constant cost. Once we have started to allocate
+  buffer on the heap, we increase the buffer size exponentially, rather
+  than linearly.
+
+  @param alloc_length The requested string size in characters, excluding any
+                      null terminator.
+
+  @retval false Either the copy operation is complete or, if the size of the
+  new buffer is smaller than the currently allocated buffer (if one exists),
+  no allocation occured.
+
+  @retval true An error occured when attempting to allocate memory.
+
+  @see mem_realloc.
+ */
+bool String::mem_realloc_exp(size_t alloc_length)
+{
+  if (mem_realloc(next_realloc_exp_size(alloc_length)))
+    return true;
+  m_ptr[alloc_length]= '\0';
   return false;
 }
 
@@ -467,7 +509,7 @@ bool String::append(const String &s)
     DBUG_ASSERT(!this->uses_buffer_owned_by(&s));
     DBUG_ASSERT(!s.uses_buffer_owned_by(this));
 
-    if (mem_realloc(m_length+s.length()))
+    if (mem_realloc_exp((m_length + s.length())))
       return true;
     memcpy(m_ptr + m_length,s.ptr(), s.length());
     m_length+=s.length();
@@ -503,7 +545,7 @@ bool String::append(const char *s, size_t arg_length)
   /*
     For an ASCII compatinble string we can just append.
   */
-  if (mem_realloc(m_length + arg_length))
+  if (mem_realloc_exp(m_length + arg_length))
     return true;
   memcpy(m_ptr + m_length, s, arg_length);
   m_length+= arg_length;
@@ -526,7 +568,7 @@ bool String::append(const char *s)
 */
 bool String::append_ulonglong(ulonglong val)
 {
-  if (mem_realloc(m_length + MAX_BIGINT_WIDTH + 2))
+  if (mem_realloc_exp(m_length + MAX_BIGINT_WIDTH + 2))
     return true;
   char *end= longlong10_to_str(val, m_ptr + m_length, 10);
   m_length= end - m_ptr;
@@ -539,7 +581,7 @@ bool String::append_ulonglong(ulonglong val)
 */
 bool String::append_longlong(longlong val)
 {
-  if (mem_realloc(m_length + MAX_BIGINT_WIDTH + 2))
+  if (mem_realloc_exp(m_length + MAX_BIGINT_WIDTH + 2))
     return true;                              /* purecov: inspected */
   char *end= longlong10_to_str(val, m_ptr + m_length, -10);
   m_length= end - m_ptr;
@@ -564,7 +606,7 @@ bool String::append(const char *s, size_t arg_length, const CHARSET_INFO *cs)
       DBUG_ASSERT(m_charset->mbminlen > offset);
       offset= m_charset->mbminlen - offset; // How many characters to pad
       add_length= arg_length + offset;
-      if (mem_realloc(m_length + add_length))
+      if (mem_realloc_exp(m_length + add_length))
         return true;
       memset(m_ptr + m_length, 0, offset);
       memcpy(m_ptr + m_length + offset, s, arg_length);
@@ -574,14 +616,14 @@ bool String::append(const char *s, size_t arg_length, const CHARSET_INFO *cs)
 
     add_length= arg_length / cs->mbminlen * m_charset->mbmaxlen;
     uint dummy_errors;
-    if (mem_realloc(m_length + add_length))
+    if (mem_realloc_exp(m_length + add_length))
       return true;
     m_length+= copy_and_convert(m_ptr + m_length, add_length, m_charset,
                                 s, arg_length, cs, &dummy_errors);
   }
   else
   {
-    if (mem_realloc(m_length + arg_length))
+    if (mem_realloc_exp(m_length + arg_length))
       return true;
     memcpy(m_ptr + m_length, s, arg_length);
     m_length+= arg_length;

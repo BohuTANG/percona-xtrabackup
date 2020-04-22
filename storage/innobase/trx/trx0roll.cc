@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2018, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -856,6 +856,8 @@ DECLARE_THREAD(trx_rollback_or_clean_all_recovered)(
 			/*!< in: a dummy parameter required by
 			os_thread_create */
 {
+	my_thread_init();
+
 	ut_ad(!srv_read_only_mode);
 
 #ifdef UNIV_PFS_THREAD
@@ -866,6 +868,7 @@ DECLARE_THREAD(trx_rollback_or_clean_all_recovered)(
 
 	trx_rollback_or_clean_is_active = false;
 
+	my_thread_end();
 	/* We count the number of threads in os_thread_exit(). A created
 	thread should always use that to exit and not use return() to exit. */
 
@@ -1084,7 +1087,8 @@ static
 que_t*
 trx_roll_graph_build(
 /*=================*/
-	trx_t*	trx)	/*!< in/out: transaction */
+	trx_t*	trx,			/*!< in/out: transaction */
+	bool	partial_rollback)	/*!< in: partial rollback */
 {
 	mem_heap_t*	heap;
 	que_fork_t*	fork;
@@ -1098,7 +1102,7 @@ trx_roll_graph_build(
 
 	thr = que_thr_create(fork, heap, NULL);
 
-	thr->child = row_undo_node_create(trx, thr, heap);
+	thr->child = row_undo_node_create(trx, thr, heap, partial_rollback);
 
 	return(fork);
 }
@@ -1112,9 +1116,10 @@ que_thr_t*
 trx_rollback_start(
 /*===============*/
 	trx_t*		trx,		/*!< in: transaction */
-	ib_id_t		roll_limit)	/*!< in: rollback to undo no (for
+	ib_id_t		roll_limit,	/*!< in: rollback to undo no (for
 					partial undo), 0 if we are rolling back
 					the entire transaction */
+	bool		partial_rollback) /*!< in: partial rollback */
 {
 	ut_ad(trx_mutex_own(trx));
 
@@ -1132,7 +1137,7 @@ trx_rollback_start(
 
 	/* Build a 'query' graph which will perform the undo operations */
 
-	que_t*	roll_graph = trx_roll_graph_build(trx);
+	que_t*	roll_graph = trx_roll_graph_build(trx, partial_rollback);
 
 	trx->graph = roll_graph;
 
@@ -1209,7 +1214,9 @@ trx_rollback_step(
 
 		trx_commit_or_rollback_prepare(trx);
 
-		node->undo_thr = trx_rollback_start(trx, roll_limit);
+		node->undo_thr = trx_rollback_start(trx,
+						    roll_limit,
+						    node->partial);
 
 		trx_mutex_exit(trx);
 

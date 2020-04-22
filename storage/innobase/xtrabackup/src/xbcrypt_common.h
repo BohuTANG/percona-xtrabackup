@@ -1,5 +1,5 @@
 /******************************************************
-Copyright (c) 2017 Percona LLC and/or its affiliates.
+Copyright (c) 2017, 2020 Percona LLC and/or its affiliates.
 
 Encryption datasink implementation for XtraBackup.
 
@@ -27,6 +27,10 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 
 #include <gcrypt.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 extern char		*ds_encrypt_key;
 extern char		*ds_encrypt_key_file;
 extern ulong		ds_encrypt_algo;
@@ -37,6 +41,10 @@ my_bool xb_crypt_read_key_file(const char *filename,
 			       void** key, uint *keylength);
 
 void xb_crypt_create_iv(void* ivbuf, size_t ivlen);
+
+/* Initialize libgcrypt */
+gcry_error_t
+xb_libgcrypt_init();
 
 /* Initialize gcrypt and setup encryption key and IV lengths */
 gcry_error_t
@@ -50,6 +58,14 @@ xb_crypt_cipher_open(gcry_cipher_hd_t *cipher_handle);
 void
 xb_crypt_cipher_close(gcry_cipher_hd_t cipher_handle);
 
+/************************************************************************
+Mask the argument value. This is to avoid showing secret data on command
+line output
+@param[in, out]         argument    argument to be masked
+@param[in,out]          opt         original argument which is reallocated
+*/
+void hide_option(char *argument, char **opt);
+
 /* Decrypt buffer */
 gcry_error_t
 xb_crypt_decrypt(gcry_cipher_hd_t cipher_handle, const uchar *from,
@@ -60,3 +76,7 @@ xb_crypt_decrypt(gcry_cipher_hd_t cipher_handle, const uchar *from,
 gcry_error_t
 xb_crypt_encrypt(gcry_cipher_hd_t cipher_handle, const uchar *from,
 		 size_t from_len, uchar *to, size_t *to_len, uchar *iv);
+
+#ifdef __cplusplus
+}
+#endif

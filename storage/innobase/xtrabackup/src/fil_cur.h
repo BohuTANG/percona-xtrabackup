@@ -29,7 +29,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #include "read_filt.h"
 
 struct xb_fil_cur_t {
-	os_file_t	file;		/*!< source file handle */
+	pfs_os_file_t	file;		/*!< source file handle */
 	fil_node_t*	node;		/*!< source tablespace node */
 	char		rel_path[FN_REFLEN];
 					/*!< normalized file path */
@@ -64,7 +64,9 @@ struct xb_fil_cur_t {
 					buffer */
 	uint		thread_n;	/*!< thread number for diagnostics */
 	ulint		space_id;	/*!< ID of tablespace */
+	ulint		space_flags;	/*!< tablespace flags */
 	ulint		space_size;	/*!< space size in pages */
+	ulint		block_size;	/*!< FS block size */
 
 	unsigned char	encryption_key[32];
 					/*!< encryption key */

@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2013, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2013, 2018, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -35,6 +35,7 @@ Created 2013-7-26 by Kevin Lewis
 #ifdef UNIV_HOTBACKUP
 #include "my_sys.h"
 #endif /* UNIV_HOTBACKUP */
+#include "xb0xb.h"
 
 /** Initialize the name, size and order of this datafile
 @param[in]	name	tablespace name, will be copied
@@ -85,7 +86,7 @@ Datafile::open_or_create(bool read_only_mode)
 {
 	bool success;
 	ut_a(m_filepath != NULL);
-	ut_ad(m_handle == OS_FILE_CLOSED);
+	ut_ad(m_handle.m_file == OS_FILE_CLOSED);
 
 	m_handle = os_file_create(
 		innodb_data_file_key, m_filepath, m_open_flags,
@@ -108,7 +109,7 @@ dberr_t
 Datafile::open_read_only(bool strict)
 {
 	bool	success = false;
-	ut_ad(m_handle == OS_FILE_CLOSED);
+	ut_ad(m_handle.m_file == OS_FILE_CLOSED);
 
 	/* This function can be called for file objects that do not need
 	to be opened, which is the case when the m_filepath is NULL */
@@ -145,7 +146,7 @@ dberr_t
 Datafile::open_read_write(bool read_only_mode)
 {
 	bool	success = false;
-	ut_ad(m_handle == OS_FILE_CLOSED);
+	ut_ad(m_handle.m_file == OS_FILE_CLOSED);
 
 	/* This function can be called for file objects that do not need
 	to be opened, which is the case when the m_filepath is NULL */
@@ -177,9 +178,9 @@ void
 Datafile::init_file_info()
 {
 #ifdef _WIN32
-	GetFileInformationByHandle(m_handle, &m_file_info);
+	GetFileInformationByHandle(m_handle.m_file, &m_file_info);
 #else
-	fstat(m_handle, &m_file_info);
+	fstat(m_handle.m_file, &m_file_info);
 #endif	/* WIN32 */
 }
 
@@ -188,13 +189,11 @@ Datafile::init_file_info()
 dberr_t
 Datafile::close()
 {
-	if (m_handle != OS_FILE_CLOSED) {
-		ibool	success = os_file_close(m_handle);
+	 if (m_handle.m_file != OS_FILE_CLOSED) {
+		ibool   success = os_file_close(m_handle);
 		ut_a(success);
-
-		m_handle = OS_FILE_CLOSED;
+		m_handle.m_file = OS_FILE_CLOSED;
 	}
-
 	return(DB_SUCCESS);
 }
 
@@ -313,10 +312,8 @@ datafile.  The Datafile must already be open.
 dberr_t
 Datafile::read_first_page(bool read_only_mode)
 {
-	if (m_handle == OS_FILE_CLOSED) {
-
+	if (m_handle.m_file == OS_FILE_CLOSED) {
 		dberr_t err = open_or_create(read_only_mode);
-
 		if (err != DB_SUCCESS) {
 			return(err);
 		}
@@ -554,6 +551,7 @@ Datafile::validate_first_page(lsn_t*	flush_lsn,
 	char*		prev_name;
 	char*		prev_filepath;
 	const char*	error_txt = NULL;
+	dberr_t		err_code = DB_CORRUPTION;	/* default error code */
 
 	m_is_valid = true;
 
@@ -586,6 +584,7 @@ Datafile::validate_first_page(lsn_t*	flush_lsn,
 
 		if (nonzero_bytes == 0) {
 			error_txt = "Header page consists of zero bytes";
+			err_code = DB_PAGE_IS_BLANK;
 		}
 	}
 
@@ -634,14 +633,15 @@ Datafile::validate_first_page(lsn_t*	flush_lsn,
 
 		free_first_page();
 
-		return(DB_CORRUPTION);
+		return(err_code);
 
 	}
 
 	/* For encrypted tablespace, check the encryption info in the
 	first page can be decrypt by master key, otherwise, this table
 	can't be open. And for importing, we skip checking it. */
-	if (FSP_FLAGS_GET_ENCRYPTION(m_flags) && !for_import) {
+	if (FSP_FLAGS_GET_ENCRYPTION(m_flags) && !for_import
+		&& (srv_backup_mode || !use_dumped_tablespace_keys)) {
 		m_encryption_key = static_cast<byte*>(
 			ut_zalloc_nokey(ENCRYPTION_KEY_LEN));
 		m_encryption_iv = static_cast<byte*>(
@@ -653,21 +653,43 @@ Datafile::validate_first_page(lsn_t*	flush_lsn,
 						   m_encryption_key,
 						   m_encryption_iv,
 						   m_first_page)) {
-			ib::error()
+			ib::info()
 				<< "Encryption information in"
 				<< " datafile: " << m_filepath
-				<< " can't be decrypted"
-				<< " , please confirm the keyfile"
-				<< " is match and keyring plugin"
-				<< " is loaded.";
+				<< " can't be decrypted,"
+				<< " please check if a keyring plugin"
+				<< " is loaded and initialized successfully.";
 
-			m_is_valid = false;
-			free_first_page();
-			ut_free(m_encryption_key);
-			ut_free(m_encryption_iv);
-			m_encryption_key = NULL;
-			m_encryption_iv = NULL;
-			return(DB_CORRUPTION);
+			bool found = false;
+
+                        if (srv_backup_mode) {
+				mutex_enter(&recv_sys->mutex);
+				encryption_list_t::iterator	it;
+				for (it = recv_sys->encryption_list->begin();
+				     it != recv_sys->encryption_list->end();
+				     it++) {
+					if (it->space_id == m_space_id) {
+						memcpy(m_encryption_key,
+						       it->key,
+						       ENCRYPTION_KEY_LEN);
+						memcpy(m_encryption_iv, it->iv,
+						       ENCRYPTION_KEY_LEN);
+						found = true;
+					}
+				}
+				mutex_exit(&recv_sys->mutex);
+                        }
+
+			if (!found) {
+				m_is_valid = false;
+				free_first_page();
+				ut_free(m_encryption_key);
+				ut_free(m_encryption_iv);
+				m_encryption_key = NULL;
+				m_encryption_iv = NULL;
+				return(DB_CORRUPTION);
+                        }
+
 		}
 
 		if (recv_recovery_is_on()
@@ -678,6 +700,18 @@ Datafile::validate_first_page(lsn_t*	flush_lsn,
 			ut_free(m_encryption_iv);
 			m_encryption_key = NULL;
 			m_encryption_iv = NULL;
+		}
+	}
+
+	if (FSP_FLAGS_GET_ENCRYPTION(m_flags)
+		&& !srv_backup_mode && use_dumped_tablespace_keys) {
+		const page_size_t page_size(m_flags);
+		ulint offset = fsp_header_get_encryption_offset(page_size);
+		ut_ad(offset != 0);
+		ulint master_key_id = mach_read_from_4(
+			m_first_page + offset + ENCRYPTION_MAGIC_SIZE);
+		if (Encryption::master_key_id < master_key_id) {
+			Encryption::master_key_id = master_key_id;
 		}
 	}
 
@@ -721,7 +755,7 @@ Datafile::find_space_id()
 {
 	os_offset_t	file_size;
 
-	ut_ad(m_handle != OS_FILE_CLOSED);
+	ut_ad(m_handle.m_file != OS_FILE_CLOSED);
 
 	file_size = os_file_get_size(m_handle);
 

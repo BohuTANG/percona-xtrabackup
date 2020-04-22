@@ -1,4 +1,4 @@
-# Copyright (c) 2009, 2016, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2018, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -62,31 +62,10 @@ IF(NOT SYSTEM_TYPE)
   ENDIF()
 ENDIF()
 
-# The default C++ library for SunPro is really old, and not standards compliant.
-# http://www.oracle.com/technetwork/server-storage/solaris10/cmp-stlport-libcstd-142559.html
-# Use stlport rather than Rogue Wave,
-#   unless otherwise specified on command line.
-IF(CMAKE_SYSTEM_NAME MATCHES "SunOS")
-  IF(CMAKE_CXX_COMPILER_ID MATCHES "SunPro")
-    IF(CMAKE_CXX_FLAGS MATCHES "-std=")
-      ADD_DEFINITIONS(-D__MATHERR_RENAME_EXCEPTION)
-      SET(CMAKE_SHARED_LIBRARY_C_FLAGS
-        "${CMAKE_SHARED_LIBRARY_C_FLAGS} -lc")
-      SET(CMAKE_SHARED_LIBRARY_CXX_FLAGS
-        "${CMAKE_SHARED_LIBRARY_CXX_FLAGS} -lstdc++ -lgcc_s -lCrunG3 -lc")
-      SET(QUOTED_CMAKE_CXX_LINK_FLAGS "-lstdc++ -lgcc_s -lCrunG3 -lc")
-    ELSE()
-      IF(SUNPRO_CXX_LIBRARY)
-        SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -library=${SUNPRO_CXX_LIBRARY}")
-        IF(SUNPRO_CXX_LIBRARY STREQUAL "stdcxx4")
-          ADD_DEFINITIONS(-D__MATHERR_RENAME_EXCEPTION)
-          SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -template=extdef")
-        ENDIF()
-      ELSE()
-        SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -library=stlport4")
-      ENDIF()
-    ENDIF()
-  ENDIF()
+# Probobuf 2.6.1 on Sparc. Both gcc and Solaris Studio need this.
+IF(CMAKE_SYSTEM_NAME MATCHES "SunOS" AND
+    SIZEOF_VOIDP EQUAL 8 AND CMAKE_SYSTEM_PROCESSOR MATCHES "sparc")
+  ADD_DEFINITIONS(-DSOLARIS_64BIT_ENABLED)
 ENDIF()
 
 # Check to see if we are using LLVM's libc++ rather than e.g. libstd++
@@ -106,159 +85,40 @@ MACRO(DIRNAME IN OUT)
   GET_FILENAME_COMPONENT(${OUT} ${IN} PATH)
 ENDMACRO()
 
-MACRO(FIND_REAL_LIBRARY SOFTLINK_NAME REALNAME)
-  # We re-distribute libstlport.so/libstdc++.so which are both symlinks.
-  # There is no 'readlink' on solaris, so we use perl to follow links:
-  SET(PERLSCRIPT
-    "my $link= $ARGV[0]; use Cwd qw(abs_path); my $file = abs_path($link); print $file;")
-  EXECUTE_PROCESS(
-    COMMAND perl -e "${PERLSCRIPT}" ${SOFTLINK_NAME}
-    RESULT_VARIABLE result
-    OUTPUT_VARIABLE real_library
-    )
-  SET(REALNAME ${real_library})
-ENDMACRO()
 
-MACRO(EXTEND_CXX_LINK_FLAGS LIBRARY_PATH)
-  # Using the $ORIGIN token with the -R option to locate the libraries
-  # on a path relative to the executable:
-  # We need an extra backslash to pass $ORIGIN to the mysql_config script...
-  SET(QUOTED_CMAKE_CXX_LINK_FLAGS
-    "${CMAKE_CXX_LINK_FLAGS} -R'\\$ORIGIN/../lib' -R${LIBRARY_PATH}")
-  SET(CMAKE_CXX_LINK_FLAGS
-    "${CMAKE_CXX_LINK_FLAGS} -R'\$ORIGIN/../lib' -R${LIBRARY_PATH}")
-  MESSAGE(STATUS "CMAKE_CXX_LINK_FLAGS ${CMAKE_CXX_LINK_FLAGS}")
-ENDMACRO()
-
-MACRO(EXTEND_C_LINK_FLAGS LIBRARY_PATH)
-  SET(QUOTED_CMAKE_C_LINK_FLAGS
-    "${CMAKE_C_LINK_FLAGS} -R'\\$ORIGIN/../lib' -R${LIBRARY_PATH}")
-  SET(CMAKE_C_LINK_FLAGS
-    "${CMAKE_C_LINK_FLAGS} -R'\$ORIGIN/../lib' -R${LIBRARY_PATH}")
-  MESSAGE(STATUS "CMAKE_C_LINK_FLAGS ${CMAKE_C_LINK_FLAGS}")
-  SET(CMAKE_SHARED_LIBRARY_C_FLAGS
-    "${CMAKE_SHARED_LIBRARY_C_FLAGS} -R'\$ORIGIN/../lib' -R${LIBRARY_PATH}")
-ENDMACRO()
-
-IF(CMAKE_SYSTEM_NAME MATCHES "SunOS" AND CMAKE_COMPILER_IS_GNUCC)
+# We assume that developer studio runtime libraries are installed.
+IF(CMAKE_SYSTEM_NAME MATCHES "SunOS" AND
+   CMAKE_CXX_COMPILER_ID STREQUAL "SunPro")
   DIRNAME(${CMAKE_CXX_COMPILER} CXX_PATH)
-  SET(LIB_SUFFIX "lib")
+
+  SET(LIBRARY_SUFFIX "lib/compilers/CC-gcc/lib")
   IF(SIZEOF_VOIDP EQUAL 8 AND CMAKE_SYSTEM_PROCESSOR MATCHES "sparc")
-    SET(LIB_SUFFIX "lib/sparcv9")
+    SET(LIBRARY_SUFFIX "${LIBRARY_SUFFIX}/sparcv9")
   ENDIF()
   IF(SIZEOF_VOIDP EQUAL 8 AND CMAKE_SYSTEM_PROCESSOR MATCHES "i386")
-    SET(LIB_SUFFIX "lib/amd64")
+    SET(LIBRARY_SUFFIX "${LIBRARY_SUFFIX}/amd64")
   ENDIF()
-  FIND_LIBRARY(GPP_LIBRARY_NAME
-    NAMES "stdc++"
-    PATHS ${CXX_PATH}/../${LIB_SUFFIX}
-    NO_DEFAULT_PATH
-  )
-  MESSAGE(STATUS "GPP_LIBRARY_NAME ${GPP_LIBRARY_NAME}")
-  IF(GPP_LIBRARY_NAME)
-    DIRNAME(${GPP_LIBRARY_NAME} GPP_LIBRARY_PATH)
-    FIND_REAL_LIBRARY(${GPP_LIBRARY_NAME} real_library)
-    MESSAGE(STATUS "INSTALL ${GPP_LIBRARY_NAME} ${real_library}")
-    INSTALL(FILES ${GPP_LIBRARY_NAME} ${real_library}
-            DESTINATION ${INSTALL_LIBDIR} COMPONENT SharedLibraries)
-    EXTEND_CXX_LINK_FLAGS(${GPP_LIBRARY_PATH})
-    EXECUTE_PROCESS(
-      COMMAND sh -c "elfdump ${real_library} | grep SONAME"
-      RESULT_VARIABLE result
-      OUTPUT_VARIABLE sonameline
-    )
-    IF(NOT result)
-      STRING(REGEX MATCH "libstdc.*[^\n]" soname ${sonameline})
-      MESSAGE(STATUS "INSTALL ${GPP_LIBRARY_PATH}/${soname}")
-      INSTALL(FILES "${GPP_LIBRARY_PATH}/${soname}"
-              DESTINATION ${INSTALL_LIBDIR} COMPONENT SharedLibraries)
-    ENDIF()
-  ENDIF()
-  FIND_LIBRARY(GCC_LIBRARY_NAME
-    NAMES "gcc_s"
-    PATHS ${CXX_PATH}/../${LIB_SUFFIX}
-    NO_DEFAULT_PATH
-  )
-  IF(GCC_LIBRARY_NAME)
-    DIRNAME(${GCC_LIBRARY_NAME} GCC_LIBRARY_PATH)
-    FIND_REAL_LIBRARY(${GCC_LIBRARY_NAME} real_library)
-    MESSAGE(STATUS "INSTALL ${GCC_LIBRARY_NAME} ${real_library}")
-    INSTALL(FILES ${GCC_LIBRARY_NAME} ${real_library}
-            DESTINATION ${INSTALL_LIBDIR} COMPONENT SharedLibraries)
-    EXTEND_C_LINK_FLAGS(${GCC_LIBRARY_PATH})
-  ENDIF()
-ENDIF()
-
-IF(CMAKE_SYSTEM_NAME MATCHES "SunOS" AND
-   CMAKE_C_COMPILER_ID MATCHES "SunPro" AND
-   CMAKE_CXX_FLAGS MATCHES "stlport4")
-  DIRNAME(${CMAKE_CXX_COMPILER} CXX_PATH)
-  # Also extract real path to the compiler(which is normally
-  # in <install_path>/prod/bin) and try to find the
-  # stlport libs relative to that location as well.
-  GET_FILENAME_COMPONENT(CXX_REALPATH ${CMAKE_CXX_COMPILER} REALPATH)
-
-  # CC -V yields
-  # CC: Sun C++ 5.13 SunOS_sparc Beta 2014/03/11
-  # CC: Sun C++ 5.11 SunOS_sparc 2010/08/13
-
-  EXECUTE_PROCESS(
-    COMMAND ${CMAKE_CXX_COMPILER} "-V"
-    OUTPUT_VARIABLE stdout
-    ERROR_VARIABLE  stderr
-    RESULT_VARIABLE result
-  )
-  IF(result)
-    MESSAGE(FATAL_ERROR "Failed to execute ${CMAKE_CXX_COMPILER} -V")
-  ENDIF()
-
-  STRING(REGEX MATCH "CC: Sun C\\+\\+ 5\\.([0-9]+)" VERSION_STRING ${stderr})
-  SET(CC_MINOR_VERSION ${CMAKE_MATCH_1})
-
-  IF(${CC_MINOR_VERSION} EQUAL 13)
-    SET(STLPORT_SUFFIX "lib/compilers/stlport4")
-    IF(SIZEOF_VOIDP EQUAL 8 AND CMAKE_SYSTEM_PROCESSOR MATCHES "sparc")
-      SET(STLPORT_SUFFIX "lib/compilers/stlport4/sparcv9")
-    ENDIF()
-    IF(SIZEOF_VOIDP EQUAL 8 AND CMAKE_SYSTEM_PROCESSOR MATCHES "i386")
-      SET(STLPORT_SUFFIX "lib/compilers/stlport4/amd64")
-    ENDIF()
-  ELSE()
-    SET(STLPORT_SUFFIX "lib/stlport4")
-    IF(SIZEOF_VOIDP EQUAL 8 AND CMAKE_SYSTEM_PROCESSOR MATCHES "sparc")
-      SET(STLPORT_SUFFIX "lib/stlport4/v9")
-    ENDIF()
-    IF(SIZEOF_VOIDP EQUAL 8 AND CMAKE_SYSTEM_PROCESSOR MATCHES "i386")
-      SET(STLPORT_SUFFIX "lib/stlport4/amd64")
-    ENDIF()
-  ENDIF()
-
   FIND_LIBRARY(STL_LIBRARY_NAME
-    NAMES "stlport"
-    PATHS ${CXX_PATH}/../${STLPORT_SUFFIX}
-          ${CXX_REALPATH}/../../${STLPORT_SUFFIX}
+    NAMES "stdc++"
+    PATHS ${CXX_PATH}/../${LIBRARY_SUFFIX}
+    NO_DEFAULT_PATH
   )
   MESSAGE(STATUS "STL_LIBRARY_NAME ${STL_LIBRARY_NAME}")
   IF(STL_LIBRARY_NAME)
-    DIRNAME(${STL_LIBRARY_NAME} STLPORT_PATH)
-    FIND_REAL_LIBRARY(${STL_LIBRARY_NAME} real_library)
-    MESSAGE(STATUS "INSTALL ${STL_LIBRARY_NAME} ${real_library}")
-    INSTALL(FILES ${STL_LIBRARY_NAME} ${real_library}
-            DESTINATION ${INSTALL_LIBDIR} COMPONENT SharedLibraries)
-    EXTEND_C_LINK_FLAGS(${STLPORT_PATH})
-    EXTEND_CXX_LINK_FLAGS(${STLPORT_PATH})
-  ELSE()
-    MESSAGE(STATUS "Failed to find the reuired stlport library, print some"
-                   "variables to help debugging and bail out")
-    MESSAGE(STATUS "CMAKE_CXX_COMPILER ${CMAKE_CXX_COMPILER}")
-    MESSAGE(STATUS "CXX_PATH ${CXX_PATH}")
-    MESSAGE(STATUS "CXX_REALPATH ${CXX_REALPATH}")
-    MESSAGE(STATUS "STLPORT_SUFFIX ${STLPORT_SUFFIX}")
-    MESSAGE(STATUS "PATH: ${CXX_PATH}/../${STLPORT_SUFFIX}")
-    MESSAGE(STATUS "PATH: ${CXX_REALPATH}/../../${STLPORT_SUFFIX}")
-    MESSAGE(FATAL_ERROR
-      "Could not find the required stlport library.")
+    DIRNAME(${STL_LIBRARY_NAME} STL_LIBRARY_PATH)
+    SET(QUOTED_CMAKE_CXX_LINK_FLAGS
+      "${CMAKE_CXX_LINK_FLAGS} -L${STL_LIBRARY_PATH} -R${STL_LIBRARY_PATH}")
+    SET(CMAKE_CXX_LINK_FLAGS
+      "${CMAKE_CXX_LINK_FLAGS} -L${STL_LIBRARY_PATH} -R${STL_LIBRARY_PATH}")
+    SET(CMAKE_C_LINK_FLAGS
+      "${CMAKE_C_LINK_FLAGS} -L${STL_LIBRARY_PATH} -R${STL_LIBRARY_PATH}")
   ENDIF()
+  SET(CMAKE_C_LINK_FLAGS
+    "${CMAKE_C_LINK_FLAGS} -lc")
+  SET(CMAKE_CXX_LINK_FLAGS
+    "${CMAKE_CXX_LINK_FLAGS} -lstdc++ -lgcc_s -lCrunG3 -lc")
+  SET(QUOTED_CMAKE_CXX_LINK_FLAGS
+    "${QUOTED_CMAKE_CXX_LINK_FLAGS} -lstdc++ -lgcc_s -lCrunG3 -lc ")
 ENDIF()
 
 IF(CMAKE_COMPILER_IS_GNUCXX)
@@ -328,9 +188,13 @@ IF(UNIX)
     MY_SEARCH_LIBS(clock_gettime rt LIBRT)
   ENDIF()
   MY_SEARCH_LIBS(timer_create rt LIBRT)
+  MY_SEARCH_LIBS(atomic_thread_fence atomic LIBATOMIC)
+  MY_SEARCH_LIBS(backtrace execinfo LIBEXECINFO)
 
   SET(CMAKE_REQUIRED_LIBRARIES 
-    ${LIBM} ${LIBNSL} ${LIBBIND} ${LIBCRYPT} ${LIBSOCKET} ${LIBDL} ${CMAKE_THREAD_LIBS_INIT} ${LIBRT})
+    ${LIBM} ${LIBNSL} ${LIBBIND} ${LIBCRYPT} ${LIBSOCKET} ${LIBDL}
+    ${CMAKE_THREAD_LIBS_INIT} ${LIBRT} ${LIBATOMIC} ${LIBEXECINFO}
+  )
   # Need explicit pthread for gcc -fsanitize=address
   IF(CMAKE_C_FLAGS MATCHES "-fsanitize=")
     SET(CMAKE_REQUIRED_LIBRARIES ${CMAKE_REQUIRED_LIBRARIES} pthread)
@@ -356,6 +220,20 @@ IF(UNIX)
       hosts_access(0);
     }"
     HAVE_LIBWRAP)
+
+    IF(HAVE_LIBWRAP)
+      CHECK_CXX_SOURCE_COMPILES(
+      "
+      #include <tcpd.h>
+      int main()
+      {
+        struct request_info req;
+        if (req.sink)
+          (req.sink)(req.fd);
+      }"
+      HAVE_LIBWRAP_PROTOTYPES)
+    ENDIF()
+
     SET(CMAKE_REQUIRED_LIBRARIES ${SAVE_CMAKE_REQUIRED_LIBRARIES})
     IF(HAVE_LIBWRAP)
       SET(LIBWRAP "wrap")
@@ -375,6 +253,7 @@ INCLUDE (CheckIncludeFiles)
 
 CHECK_INCLUDE_FILES (alloca.h HAVE_ALLOCA_H)
 CHECK_INCLUDE_FILES (arpa/inet.h HAVE_ARPA_INET_H)
+CHECK_INCLUDE_FILES (crypt.h HAVE_CRYPT_H)
 CHECK_INCLUDE_FILES (dlfcn.h HAVE_DLFCN_H)
 CHECK_INCLUDE_FILES (execinfo.h HAVE_EXECINFO_H)
 CHECK_INCLUDE_FILES (fpu_control.h HAVE_FPU_CONTROL_H)
@@ -480,6 +359,7 @@ CHECK_FUNCTION_EXISTS (vasprintf HAVE_VASPRINTF)
 CHECK_FUNCTION_EXISTS (memalign HAVE_MEMALIGN)
 CHECK_FUNCTION_EXISTS (nl_langinfo HAVE_NL_LANGINFO)
 CHECK_FUNCTION_EXISTS (ntohll HAVE_HTONLL)
+CHECK_FUNCTION_EXISTS (memset_s HAVE_MEMSET_S)
 
 CHECK_FUNCTION_EXISTS (clock_gettime DNS_USE_CPU_CLOCK_FOR_ID)
 CHECK_FUNCTION_EXISTS (epoll_create HAVE_EPOLL)
@@ -599,6 +479,9 @@ ENDIF()
 
 SET(CMAKE_EXTRA_INCLUDE_FILES)
 
+# Support for tagging symbols with __attribute__((visibility("hidden")))
+MY_CHECK_CXX_COMPILER_FLAG("-fvisibility=hidden" HAVE_VISIBILITY_HIDDEN)
+
 #
 # Code tests
 #
@@ -692,14 +575,6 @@ CHECK_CXX_SOURCE_COMPILES("
 ENDIF()
 
 CHECK_C_SOURCE_COMPILES("
-  int main(int argc, char **argv) 
-  {
-    extern char *__bss_start;
-    return __bss_start ? 1 : 0;
-  }"
-HAVE_BSS_START)
-
-CHECK_C_SOURCE_COMPILES("
 int main()
 {
   __builtin_unreachable();
@@ -731,6 +606,33 @@ CHECK_CXX_SOURCE_COMPILES("
   {
     int foo= -10; int bar= 10;
     long long int foo64= -10; long long int bar64= 10;
+    if (!__atomic_fetch_add(&foo, bar, __ATOMIC_SEQ_CST) || foo)
+      return -1;
+    bar= __atomic_exchange_n(&foo, bar, __ATOMIC_SEQ_CST);
+    if (bar || foo != 10)
+      return -1;
+    bar= __atomic_compare_exchange_n(&bar, &foo, 15, 0,
+                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    if (bar)
+      return -1;
+    if (!__atomic_fetch_add(&foo64, bar64, __ATOMIC_SEQ_CST) || foo64)
+      return -1;
+    bar64= __atomic_exchange_n(&foo64, bar64, __ATOMIC_SEQ_CST);
+    if (bar64 || foo64 != 10)
+      return -1;
+    bar64= __atomic_compare_exchange_n(&bar64, &foo64, 15, 0,
+                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    if (bar64)
+      return -1;
+    return 0;
+  }"
+  HAVE_GCC_ATOMIC_BUILTINS)
+
+CHECK_CXX_SOURCE_COMPILES("
+  int main()
+  {
+    int foo= -10; int bar= 10;
+    long long int foo64= -10; long long int bar64= 10;
     if (!__sync_fetch_and_add(&foo, bar) || foo)
       return -1;
     bar= __sync_lock_test_and_set(&foo, bar);
@@ -749,7 +651,7 @@ CHECK_CXX_SOURCE_COMPILES("
       return -1;
     return 0;
   }"
-  HAVE_GCC_ATOMIC_BUILTINS)
+  HAVE_GCC_SYNC_BUILTINS)
 
 IF(WITH_VALGRIND)
   SET(VALGRIND_HEADERS "valgrind/memcheck.h;valgrind/valgrind.h")
@@ -809,6 +711,17 @@ CHECK_STRUCT_HAS_MEMBER("struct sockaddr_in" sin_len
 CHECK_STRUCT_HAS_MEMBER("struct sockaddr_in6" sin6_len
   "${CMAKE_EXTRA_INCLUDE_FILES}" HAVE_SOCKADDR_IN6_SIN6_LEN)
 
+# Check for pthread_threadid_np()
+CHECK_C_SOURCE_COMPILES("
+#include <pthread.h>
+int main(int ac, char **av)
+{
+  unsigned long long tid64;
+  pthread_threadid_np(NULL, &tid64);
+  return (tid64 != 0 ? 0 : 1);
+}"
+HAVE_PTHREAD_THREADID_NP)
+
 CHECK_CXX_SOURCE_COMPILES(
   "
   #include <vector>
@@ -838,9 +751,11 @@ CHECK_CXX_SOURCE_COMPILES(
 SET(CMAKE_EXTRA_INCLUDE_FILES)
 
 CHECK_FUNCTION_EXISTS(chown HAVE_CHOWN)
-CHECK_INCLUDE_FILES (numaif.h HAVE_NUMAIF_H)
-OPTION(WITH_NUMA "Explicitly set NUMA memory allocation policy" ON)
-IF(HAVE_NUMAIF_H AND WITH_NUMA)
+
+CHECK_INCLUDE_FILES(numa.h HAVE_NUMA_H)
+CHECK_INCLUDE_FILES(numaif.h HAVE_NUMAIF_H)
+
+IF(HAVE_NUMA_H AND HAVE_NUMAIF_H)
     SET(SAVE_CMAKE_REQUIRED_LIBRARIES ${CMAKE_REQUIRED_LIBRARIES})
     SET(CMAKE_REQUIRED_LIBRARIES ${CMAKE_REQUIRED_LIBRARIES} numa)
     CHECK_C_SOURCE_COMPILES(
@@ -855,6 +770,29 @@ IF(HAVE_NUMAIF_H AND WITH_NUMA)
     }"
     HAVE_LIBNUMA)
     SET(CMAKE_REQUIRED_LIBRARIES ${SAVE_CMAKE_REQUIRED_LIBRARIES})
+ELSE()
+    SET(HAVE_LIBNUMA 0)
+ENDIF()
+
+IF(NOT HAVE_LIBNUMA)
+   MESSAGE(STATUS "NUMA library missing or required version not available")
+ENDIF()
+
+IF(HAVE_LIBNUMA AND HAVE_NUMA_H AND HAVE_NUMAIF_H)
+  OPTION(WITH_NUMA "Explicitly set NUMA memory allocation policy" ON)
+ELSE()
+  OPTION(WITH_NUMA "Explicitly set NUMA memory allocation policy" OFF)
+ENDIF()
+
+IF(WITH_NUMA AND NOT HAVE_LIBNUMA)
+  # Forget it in cache, abort the build.
+  UNSET(WITH_NUMA CACHE)
+  MESSAGE(FATAL_ERROR "NUMA library missing or required version not available")
+ENDIF()
+
+IF(HAVE_LIBNUMA AND NOT WITH_NUMA)
+   SET(HAVE_LIBNUMA 0)
+   MESSAGE(STATUS "Disabling NUMA on user's request")
 ENDIF()
 
 # needed for libevent

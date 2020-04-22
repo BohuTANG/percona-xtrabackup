@@ -1,4 +1,4 @@
-/* Copyright (c) 2016, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2016, 2019, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -16,6 +16,7 @@
 #include <my_global.h>
 #include <mysql/plugin_keyring.h>
 #include "keyring.h"
+#include "buffered_file_io.h"
 
 #ifdef _WIN32
 #define MYSQL_DEFAULT_KEYRINGFILE MYSQL_KEYRINGDIR"\\keyring"
@@ -24,35 +25,11 @@
 #endif
 
 using keyring::Buffered_file_io;
-using keyring::Key;
 using keyring::Keys_container;
+using keyring::Keys_iterator;
 using keyring::Logger;
 
-my_bool create_keyring_dir_if_does_not_exist(const char *keyring_file_path)
-{
-  if (!keyring_file_path || strlen(keyring_file_path) == 0)
-    return TRUE;
-  char keyring_dir[FN_REFLEN];
-  size_t keyring_dir_length;
-  dirname_part(keyring_dir, keyring_file_path, &keyring_dir_length);
-  if (keyring_dir_length > 1 && (keyring_dir[keyring_dir_length-1] == FN_LIBCHAR ||
-                                 keyring_dir[keyring_dir_length-1] == FN_LIBCHAR2) )
-  {
-    keyring_dir[keyring_dir_length-1]= '\0';
-    --keyring_dir_length;
-  }
-  int flags=
-#ifdef _WIN32
-    0
-#else
-    S_IRWXU | S_IRGRP | S_IXGRP
-#endif
-    ;
-  if (strlen(keyring_dir) == 0)
-    return TRUE;
-  my_mkdir(keyring_dir, flags, MYF(0));
-  return FALSE;
-}
+mysql_rwlock_t LOCK_keyring;
 
 int check_keyring_file_data(MYSQL_THD thd  MY_ATTRIBUTE((unused)),
                             struct st_mysql_sys_var *var  MY_ATTRIBUTE((unused)),
@@ -61,7 +38,6 @@ int check_keyring_file_data(MYSQL_THD thd  MY_ATTRIBUTE((unused)),
   char            buff[FN_REFLEN+1];
   const char      *keyring_filename;
   int             len = sizeof(buff);
-  Buffered_file_io keyring_io(logger.get());
   boost::movelib::unique_ptr<IKeys_container> new_keys(new Keys_container(logger.get()));
 
   (*(const char **) save)= NULL;
@@ -76,7 +52,8 @@ int check_keyring_file_data(MYSQL_THD thd  MY_ATTRIBUTE((unused)),
   }
   try
   {
-    if (new_keys->init(&keyring_io, keyring_filename))
+    IKeyring_io *keyring_io(new Buffered_file_io(logger.get()));
+    if (new_keys->init(keyring_io, keyring_filename))
     {
       mysql_rwlock_unlock(&LOCK_keyring);
       return 1;
@@ -103,9 +80,14 @@ static MYSQL_SYSVAR_STR(
   update_keyring_file_data,                                    /* update()   */
   MYSQL_DEFAULT_KEYRINGFILE                                    /* default    */
 );
+static MYSQL_SYSVAR_BOOL(open_mode, keyring_open_mode,
+                         PLUGIN_VAR_INVISIBLE | PLUGIN_VAR_RQCMDARG,
+                         "Mode in which keyring file should be opened", NULL,
+                         NULL, TRUE);
 
 static struct st_mysql_sys_var *keyring_file_system_variables[]= {
   MYSQL_SYSVAR(data),
+  MYSQL_SYSVAR(open_mode),
   NULL
 };
 
@@ -117,6 +99,8 @@ static int keyring_init(MYSQL_PLUGIN plugin_info)
     keyring_init_psi_keys();
 #endif
 
+    DBUG_EXECUTE_IF("simulate_keyring_init_error", return TRUE;);
+
     if (init_keyring_locks())
       return TRUE;
 
@@ -126,11 +110,11 @@ static int keyring_init(MYSQL_PLUGIN plugin_info)
       logger->log(MY_ERROR_LEVEL, "Could not create keyring directory "
         "The keyring_file will stay unusable until correct path to the keyring "
         "directory gets provided");
-      return FALSE;
+      return TRUE;
     }
-    Buffered_file_io keyring_io(logger.get());
     keys.reset(new Keys_container(logger.get()));
-    if (keys->init(&keyring_io, keyring_file_data_value))
+    IKeyring_io *keyring_io= new Buffered_file_io(logger.get());
+    if (keys->init(keyring_io, keyring_file_data_value))
     {
       is_keys_container_initialized = FALSE;
       logger->log(MY_ERROR_LEVEL, "keyring_file initialization failure. Please check"
@@ -138,7 +122,7 @@ static int keyring_init(MYSQL_PLUGIN plugin_info)
         " can be created in the specified location. "
         "The keyring_file will stay unusable until correct path to the keyring file "
         "gets provided");
-      return FALSE;
+      return TRUE;
     }
     is_keys_container_initialized = TRUE;
     return FALSE;
@@ -166,20 +150,20 @@ int keyring_deinit(void *arg MY_ATTRIBUTE((unused)))
 my_bool mysql_key_fetch(const char *key_id, char **key_type, const char *user_id,
                         void **key, size_t *key_len)
 {
-  return mysql_key_fetch<Buffered_file_io, Key>(key_id, key_type, user_id, key,
-                                                key_len);
+  return mysql_key_fetch<keyring::Key>(key_id, key_type, user_id, key, key_len,
+                                       "keyring_file");
 }
 
 my_bool mysql_key_store(const char *key_id, const char *key_type,
                         const char *user_id, const void *key, size_t key_len)
 {
-  return mysql_key_store<Buffered_file_io, Key>(key_id, key_type, user_id, key,
-                                                key_len);
+  return mysql_key_store<keyring::Key>(key_id, key_type, user_id, key, key_len,
+                                       "keyring_file");
 }
 
 my_bool mysql_key_remove(const char *key_id, const char *user_id)
 {
-  return mysql_key_remove<Buffered_file_io, Key>(key_id, user_id);
+  return mysql_key_remove<keyring::Key>(key_id, user_id, "keyring_file");
 }
 
 
@@ -188,14 +172,13 @@ my_bool mysql_key_generate(const char *key_id, const char *key_type,
 {
   try
   {
-    Buffered_file_io keyring_io(logger.get());
-    boost::movelib::unique_ptr<IKey> key_candidate(new Key(key_id, key_type, user_id, NULL, 0));
+    boost::movelib::unique_ptr<IKey> key_candidate(new keyring::Key(key_id, key_type, user_id, NULL, 0));
 
     boost::movelib::unique_ptr<uchar[]> key(new uchar[key_len]);
     if (key.get() == NULL)
       return TRUE;
     memset(key.get(), 0, key_len);
-    if (is_keys_container_initialized == FALSE || check_key_for_writting(key_candidate.get(), "generating") ||
+    if (is_keys_container_initialized == FALSE || check_key_for_writing(key_candidate.get(), "generating") ||
         my_rand_buffer(key.get(), key_len))
       return TRUE;
 
@@ -209,6 +192,27 @@ my_bool mysql_key_generate(const char *key_id, const char *key_type,
   }
 }
 
+static void mysql_key_iterator_init(void **key_iterator)
+{
+  *key_iterator= new Keys_iterator(logger.get());
+  mysql_key_iterator_init<keyring::Key>(static_cast<Keys_iterator*>(*key_iterator),
+                                               "keyring_file");
+}
+
+static void mysql_key_iterator_deinit(void *key_iterator)
+{
+  mysql_key_iterator_deinit<keyring::Key>(static_cast<Keys_iterator*>(key_iterator),
+                                          "keyring_file");
+  delete static_cast<Keys_iterator*>(key_iterator);
+}
+
+static bool mysql_key_iterator_get_key(void *key_iterator,
+                                       char *key_id, char *user_id)
+{
+  return mysql_key_iterator_get_key<keyring::Key>(static_cast<Keys_iterator*>(key_iterator),
+                                                  key_id, user_id, "keyring_file");
+}
+
 /* Plugin type-specific descriptor */
 static struct st_mysql_keyring keyring_descriptor=
 {
@@ -216,7 +220,10 @@ static struct st_mysql_keyring keyring_descriptor=
   mysql_key_store,
   mysql_key_fetch,
   mysql_key_remove,
-  mysql_key_generate
+  mysql_key_generate,
+  mysql_key_iterator_init,
+  mysql_key_iterator_deinit,
+  mysql_key_iterator_get_key
 };
 
 mysql_declare_plugin(keyring_file)

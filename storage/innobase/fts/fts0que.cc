@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2007, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2007, 2018, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -153,6 +153,13 @@ struct fts_query_t {
 	bool		multi_exist;	/*!< multiple FTS_EXIST oper */
 
 	st_mysql_ftparser*	parser;	/*!< fts plugin parser */
+
+	/** limit value for the fts query */
+	ulonglong		limit;
+
+	/** number of docs fetched by query. This is to restrict the
+	result with limit value */
+	ulonglong		n_docs;
 };
 
 /** For phrase matching, first we collect the documents and the positions
@@ -3208,6 +3215,11 @@ fts_query_filter_doc_ids(
 	ulint		decoded = 0;
 	ib_rbt_t*	doc_freqs = word_freq->doc_freqs;
 
+	if (query->limit != ULONG_UNDEFINED
+	    && query->n_docs >= query->limit) {
+		return(DB_SUCCESS);
+	}
+
 	/* Decode the ilist and add the doc ids to the query doc_id set. */
 	while (decoded < len) {
 		ulint		freq = 0;
@@ -3295,14 +3307,21 @@ fts_query_filter_doc_ids(
 			/* Add the word to the document's matched RB tree. */
 			fts_query_add_word_to_document(query, doc_id, word);
 		}
+
+		if (query->limit != ULONG_UNDEFINED
+		    && query->limit <= ++query->n_docs) {
+			goto func_exit;
+		}
 	}
 
 	/* Some sanity checks. */
 	ut_a(doc_id == node->last_doc_id);
 
+func_exit:
 	if (query->total_size > fts_result_cache_limit) {
 		return(DB_FTS_EXCEED_RESULT_CACHE_LIMIT);
 	} else {
+		query->n_docs = 0;
 		return(DB_SUCCESS);
 	}
 }
@@ -3782,6 +3801,11 @@ fts_query_free(
 		fts_doc_ids_free(query->deleted);
 	}
 
+	if (query->intersection) {
+		fts_query_free_doc_ids(query, query->intersection);
+		query->intersection = NULL;
+	}
+
 	if (query->doc_ids) {
 		fts_query_free_doc_ids(query, query->doc_ids);
 	}
@@ -3903,19 +3927,26 @@ fts_query_can_optimize(
 	}
 }
 
-/*******************************************************************//**
-FTS Query entry point.
+
+
+/** FTS Query entry point.
+@param[in]	trx		transaction
+@param[in]	index		fts index to search
+@param[in]	flags		FTS search mode
+@param[in]	query_str	FTS query
+@param[in]	query_len	FTS query string len in bytes
+@param[in,out]	result		result doc ids
+@param[in]	limit		limit value
 @return DB_SUCCESS if successful otherwise error code */
 dberr_t
 fts_query(
-/*======*/
-	trx_t*		trx,		/*!< in: transaction */
-	dict_index_t*	index,		/*!< in: The FTS index to search */
-	uint		flags,		/*!< in: FTS search mode */
-	const byte*	query_str,	/*!< in: FTS query */
-	ulint		query_len,	/*!< in: FTS query string len
-					in bytes */
-	fts_result_t**	result)		/*!< in/out: result doc ids */
+	trx_t*		trx,
+	dict_index_t*	index,
+	uint		flags,
+	const byte*	query_str,
+	ulint		query_len,
+	fts_result_t**	result,
+	ulonglong	limit)
 {
 	fts_query_t	query;
 	dberr_t		error = DB_SUCCESS;
@@ -3976,6 +4007,9 @@ fts_query(
 
 	query.total_docs = dict_table_get_n_rows(index->table);
 
+	query.limit = limit;
+
+	query.n_docs = 0;
 #ifdef FTS_DOC_STATS_DEBUG
 	if (ft_enable_diag_print) {
 		error = fts_get_total_word_count(
@@ -4023,9 +4057,17 @@ fts_query(
 	lc_query_str_len = query_len * charset->casedn_multiply + 1;
 	lc_query_str = static_cast<byte*>(ut_malloc_nokey(lc_query_str_len));
 
+	/* For binary collations, a case sensitive search is
+	performed. Hence don't convert to lower case. */
+	if (my_binary_compare(charset)) {
+	memcpy(lc_query_str, query_str, query_len);
+		lc_query_str[query_len]= 0;
+		result_len= query_len;
+	} else {
 	result_len = innobase_fts_casedn_str(
-		charset, (char*) query_str, query_len,
-		(char*) lc_query_str, lc_query_str_len);
+				charset, (char*)( query_str), query_len,
+				(char*)(lc_query_str), lc_query_str_len);
+	}
 
 	ut_ad(result_len < lc_query_str_len);
 
@@ -4043,6 +4085,7 @@ fts_query(
 	/* Parse the input query string. */
 	if (fts_query_parse(&query, lc_query_str, result_len)) {
 		fts_ast_node_t*	ast = query.root;
+		ast->trx = trx;
 
 		/* Optimize query to check if it's a single term */
 		fts_query_can_optimize(&query, flags);
@@ -4051,11 +4094,29 @@ fts_query(
 			        fts_result_cache_limit = 2048;
 		);
 
+		/* Optimisation is allowed for limit value
+		when
+		i)  No ranking involved
+		ii) Only FTS Union operations involved. */
+		if (query.limit != ULONG_UNDEFINED
+		    && !fts_ast_node_check_union(ast)) {
+			query.limit = ULONG_UNDEFINED;
+		}
+
+		DBUG_EXECUTE_IF("fts_union_limit_off",
+			query.limit = ULONG_UNDEFINED;
+		);
+
 		/* Traverse the Abstract Syntax Tree (AST) and execute
 		the query. */
 		query.error = fts_ast_visit(
 			FTS_NONE, ast, fts_query_visitor,
 			&query, &will_be_ignored);
+		if (query.error == DB_INTERRUPTED) {
+			error = DB_INTERRUPTED;
+			ut_free(lc_query_str);
+			goto func_exit;
+		}
 
 		/* If query expansion is requested, extend the search
 		with first search pass result */
@@ -4080,6 +4141,15 @@ fts_query(
 		/* still return an empty result set */
 		*result = static_cast<fts_result_t*>(
 			ut_zalloc_nokey(sizeof(**result)));
+	}
+
+	if (trx_is_interrupted(trx)) {
+		error = DB_INTERRUPTED;
+		ut_free(lc_query_str);
+		if (result != NULL) {
+			fts_query_free_result(*result);
+		}
+		goto func_exit;
 	}
 
 	ut_free(lc_query_str);

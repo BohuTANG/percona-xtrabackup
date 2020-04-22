@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2007, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2007, 2018, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -195,6 +195,13 @@ fts_ast_state_free(
 /*===============*/
 	fts_ast_state_t*state);			/*!< in: state instance
 						to free */
+/** Check only union operation involved in the node
+@param[in]	node	ast node to check
+@return true if the node contains only union else false. */
+bool
+fts_ast_node_check_union(
+	fts_ast_node_t*	node);
+
 /******************************************************************//**
 Traverse the AST - in-order traversal.
 @return DB_SUCCESS if all went well */
@@ -316,6 +323,7 @@ struct fts_ast_node_t {
 	fts_ast_node_t*	next_alloc;		/*!< For tracking allocations */
 	bool		visited;		/*!< whether this node is
 						already processed */
+	trx_t*		trx;
 	/* Used by plugin parser */
 	fts_ast_node_t* up_node;		/*!< Direct up node */
 	bool		go_up;			/*!< Flag if go one level up */

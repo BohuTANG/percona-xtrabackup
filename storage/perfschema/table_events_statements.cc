@@ -1,4 +1,4 @@
-/* Copyright (c) 2010, 2015, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2010, 2018, Oracle and/or its affiliates. All rights reserved.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -310,8 +310,6 @@ table_events_statements_common::table_events_statements_common
 void table_events_statements_common::make_row_part_1(PFS_events_statements *statement,
                                                      sql_digest_storage *digest)
 {
-  const char *base;
-  const char *safe_source_file;
   ulonglong timer_end;
 
   m_row_exists= false;
@@ -347,11 +345,17 @@ void table_events_statements_common::make_row_part_1(PFS_events_statements *stat
   CHARSET_INFO *cs= get_charset(statement->m_sqltext_cs_number, MYF(0));
   size_t valid_length= statement->m_sqltext_length;
 
-  if (cs->mbmaxlen > 1)
+  if (cs != NULL)
   {
-    int well_formed_error;
-    valid_length= cs->cset->well_formed_len(cs, statement->m_sqltext, statement->m_sqltext + valid_length,
-                                            valid_length, &well_formed_error);
+    if (cs->mbmaxlen > 1)
+    {
+      int well_formed_error;
+      valid_length= cs->cset->well_formed_len(cs,
+                                              statement->m_sqltext,
+                                              statement->m_sqltext + valid_length,
+                                              valid_length,
+                                              &well_formed_error);
+    }
   }
 
   m_row.m_sqltext.set_charset(cs);
@@ -385,15 +389,8 @@ void table_events_statements_common::make_row_part_1(PFS_events_statements *stat
   if (m_row.m_object_name_length > 0)
     memcpy(m_row.m_object_name, statement->m_object_name, m_row.m_object_name_length);
 
-  safe_source_file= statement->m_source_file;
-  if (unlikely(safe_source_file == NULL))
-    return;
-
-  base= base_name(safe_source_file);
-  m_row.m_source_length= my_snprintf(m_row.m_source, sizeof(m_row.m_source),
-                                     "%s:%d", base, statement->m_source_line);
-  if (m_row.m_source_length > sizeof(m_row.m_source))
-    m_row.m_source_length= sizeof(m_row.m_source);
+  /* Disable source file and line to avoid stale __FILE__ pointers. */
+  m_row.m_source_length= 0;
 
   memcpy(m_row.m_message_text, statement->m_message_text, sizeof(m_row.m_message_text));
   m_row.m_sql_errno= statement->m_sql_errno;
