@@ -4572,7 +4572,7 @@ xb_tables_compatibility_check()
 			    "  CONCAT(table_schema, '/', table_name), engine\n"
 			    "FROM information_schema.tables\n"
 			    "WHERE engine NOT IN (\n"
-			    "  'MyISAM', 'InnoDB', 'CSV', 'MRG_MYISAM'\n"
+			    "  'MyISAM', 'InnoDB', 'TokuDB', 'CSV', 'MRG_MYISAM'\n"
 			    ")\n"
 			    "AND table_schema NOT IN (\n"
 			    "  'performance_schema', 'information_schema',"
